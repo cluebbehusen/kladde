@@ -25,15 +25,16 @@ developer. This means the developer must say something like "copy approved" or
 
 ```
 cargo test
-cargo clippy --all-targets
+cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 cargo cov-unit
 cargo cov-int
 ```
 
-All five must pass before a change is complete. `cargo cov-unit` and
+All five must pass before a change is complete. These are the same commands CI
+runs, so a clean local run means a green build. `cargo cov-unit` and
 `cargo cov-int` are aliases (see `.cargo/config.toml`) for `cargo llvm-cov`,
 enforcing 100% line coverage from unit tests alone and from integration tests
-alone. Clippy runs with `pedantic` warnings enabled; fix the code rather than
-suppressing the lint, and give any justified `#[allow]` a short reason on the
-same line.
+alone. Clippy runs with `pedantic` warnings enabled and `-D warnings` so
+warnings fail the build; fix the code rather than suppressing the lint, and
+give any justified `#[allow]` a short reason on the same line.
