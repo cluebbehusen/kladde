@@ -1,0 +1,3 @@
+[alias]
+cov-unit = "llvm-cov --lib --fail-under-lines 100 --show-missing-lines"
+cov-int = "llvm-cov --test cli --fail-under-lines 100 --show-missing-lines"
