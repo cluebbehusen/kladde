@@ -1,5 +1,3 @@
-use std::path::PathBuf;
-
 use assert_cmd::Command;
 use predicates::str::contains;
 
