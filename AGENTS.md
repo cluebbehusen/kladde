@@ -29,15 +29,16 @@ has changed" should never be considered a review finding.
 ## Development
 
 ```
-cargo test
-cargo clippy --all-targets -- -D warnings
+cargo test --locked
+cargo clippy --locked --all-targets -- -D warnings
 cargo fmt --check
 cargo cov-unit
 cargo cov-int
 npx prettier@3.9.6 --check "**/*.md"
+cargo deny check
 ```
 
-All six must pass before a change is complete. These are the same commands CI
+All seven must pass before a change is complete. These are the same commands CI
 runs, so a clean local run means a green build. `cargo cov-unit` and
 `cargo cov-int` are aliases (see `.cargo/config.toml`) for `cargo llvm-cov`,
 enforcing 100% line coverage from unit tests alone and from integration tests

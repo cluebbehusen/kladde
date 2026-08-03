@@ -26,9 +26,9 @@ jobs:
         with:
           tool: cargo-llvm-cov
       - run: cargo fmt --check
-      - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo build --all-targets
-      - run: cargo test
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo build --locked --all-targets
+      - run: cargo test --locked
       - name: Unit coverage
         shell: bash
         run: .github/coverage.sh cov-unit "Unit coverage"
@@ -41,3 +41,12 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: npx --yes prettier@3.9.6 --check "**/*.md"
+
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: taiki-e/install-action@67729d5c413db75907f0ad1e39bb04b9c868ff60 # v2.85.7
+        with:
+          tool: cargo-deny
+      - run: cargo deny check
