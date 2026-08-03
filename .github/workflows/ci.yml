@@ -35,3 +35,9 @@ jobs:
       - name: Integration coverage
         shell: bash
         run: .github/coverage.sh cov-int "Integration coverage"
+
+  markdown:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: npx --yes prettier@3.9.6 --check "**/*.md"
