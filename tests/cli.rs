@@ -93,6 +93,29 @@ fn systemroot() -> String {
     std::env::var("SYSTEMROOT").expect("SYSTEMROOT is set on Windows")
 }
 
+/// A directory link: symlink on Unix, junction on Windows (junctions need
+/// no elevation and may dangle, which the dangling test relies on).
+#[cfg(unix)]
+fn link_dir(link: &Path, target: &Path) {
+    std::os::unix::fs::symlink(target, link).expect("symlink creates");
+}
+
+#[cfg(windows)]
+fn link_dir(link: &Path, target: &Path) {
+    let cmd = format!("{}\\System32\\cmd.exe", systemroot());
+    let status = std::process::Command::new(cmd)
+        .args(["/C", "mklink", "/J"])
+        .arg(link)
+        .arg(target)
+        .status()
+        .expect("mklink runs");
+    assert!(status.success());
+}
+
+fn canonical(path: &Path) -> PathBuf {
+    fs::canonicalize(path).expect("path canonicalizes")
+}
+
 #[test]
 fn bare_invocation_shows_usage_and_fails() {
     kladde().assert().code(2).stderr(contains("Usage: kladde"));
@@ -556,4 +579,310 @@ fn config_open_reports_uncreatable_directory() {
         .assert()
         .code(1)
         .stderr(contains("cannot create"));
+}
+
+#[test]
+fn path_resolves_deep_missing_target() {
+    let nb = temp();
+    kladde()
+        .args(["path", "a/b/c.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success()
+        .stdout(format!(
+            "{}\n",
+            canonical(nb.path())
+                .join("a")
+                .join("b")
+                .join("c.md")
+                .display()
+        ));
+}
+
+#[test]
+fn path_normalizes_leading_curdir() {
+    let nb = temp();
+    kladde()
+        .args(["path", "./x.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success()
+        .stdout(format!("{}\n", canonical(nb.path()).join("x.md").display()));
+}
+
+#[test]
+fn path_falls_back_to_default_notebook() {
+    let xdg = temp();
+    let nb = temp();
+    write_config(
+        xdg.path(),
+        &format!("default-notebook = '{}'\n", nb.path().display()),
+    );
+    kladde_in(xdg.path())
+        .args(["path", "x.md"])
+        .assert()
+        .success()
+        .stdout(format!("{}\n", canonical(nb.path()).join("x.md").display()));
+}
+
+#[test]
+fn path_flag_beats_default_notebook() {
+    let xdg = temp();
+    let configured = temp();
+    let flagged = temp();
+    write_config(
+        xdg.path(),
+        &format!("default-notebook = '{}'\n", configured.path().display()),
+    );
+    kladde_in(xdg.path())
+        .args(["path", "x.md", "--notebook"])
+        .arg(flagged.path())
+        .assert()
+        .success()
+        .stdout(format!(
+            "{}\n",
+            canonical(flagged.path()).join("x.md").display()
+        ));
+}
+
+#[test]
+fn path_resolves_relative_notebook_flag() {
+    let base = temp();
+    fs::create_dir(base.path().join("nb")).expect("notebook dir creates");
+    kladde()
+        .current_dir(base.path())
+        .args(["path", "x.md", "--notebook", "nb"])
+        .assert()
+        .success()
+        .stdout(format!(
+            "{}\n",
+            canonical(&base.path().join("nb")).join("x.md").display()
+        ));
+}
+
+#[test]
+fn path_errors_without_any_notebook() {
+    let xdg = temp();
+    kladde_in(xdg.path())
+        .args(["path", "x.md"])
+        .assert()
+        .code(1)
+        .stderr(contains("no notebook: pass --notebook"));
+}
+
+#[test]
+fn path_errors_without_config_base() {
+    kladde()
+        .args(["path", "x.md"])
+        .assert()
+        .code(1)
+        .stderr(contains("cannot locate the config directory"));
+}
+
+#[test]
+fn path_reports_missing_notebook() {
+    let base = temp();
+    kladde()
+        .args(["path", "x.md", "--notebook"])
+        .arg(base.path().join("gone"))
+        .assert()
+        .code(1)
+        .stderr(contains("cannot open notebook"));
+}
+
+#[test]
+fn path_reports_file_notebook() {
+    let base = temp();
+    let file = base.path().join("plain");
+    fs::write(&file, "").expect("fixture writes");
+    kladde()
+        .args(["path", "x.md", "--notebook"])
+        .arg(&file)
+        .assert()
+        .code(1)
+        .stderr(contains("not a directory"));
+}
+
+#[test]
+fn path_reports_broken_config() {
+    let xdg = temp();
+    write_config(xdg.path(), "not toml [\n");
+    kladde_in(xdg.path())
+        .args(["path", "x.md"])
+        .assert()
+        .code(1)
+        .stderr(contains("invalid TOML"));
+}
+
+#[test]
+fn path_ignores_broken_config_with_flag() {
+    let xdg = temp();
+    let nb = temp();
+    write_config(xdg.path(), "not toml [\n");
+    kladde_in(xdg.path())
+        .args(["path", "x.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success()
+        .stdout(format!("{}\n", canonical(nb.path()).join("x.md").display()));
+}
+
+#[test]
+fn path_rejects_rooted_target() {
+    let nb = temp();
+    kladde()
+        .args(["path", "/x.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .code(1)
+        .stderr(contains("relative paths"));
+}
+
+#[test]
+fn path_rejects_parent_traversal() {
+    let nb = temp();
+    kladde()
+        .args(["path", "../x.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .code(1)
+        .stderr(contains("cannot leave the notebook"));
+}
+
+#[test]
+fn path_rejects_empty_target() {
+    let nb = temp();
+    kladde()
+        .args(["path", ".", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .code(1)
+        .stderr(contains("note target is empty"));
+}
+
+#[test]
+fn path_rejects_directory_target() {
+    let nb = temp();
+    fs::create_dir(nb.path().join("folder")).expect("fixture dir creates");
+    kladde()
+        .args(["path", "folder", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .code(1)
+        .stderr(contains("not a file"));
+}
+
+#[test]
+fn path_rejects_target_under_file() {
+    let nb = temp();
+    fs::write(nb.path().join("note.md"), "").expect("fixture writes");
+    kladde()
+        .args(["path", "note.md/nested.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .code(1)
+        .stderr(contains("not a directory"));
+}
+
+#[test]
+fn path_rejects_escaping_link() {
+    let nb = temp();
+    let outside = temp();
+    link_dir(&nb.path().join("escape"), outside.path());
+    kladde()
+        .args(["path", "escape/new.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .code(1)
+        .stderr(contains("escapes the notebook"));
+}
+
+#[test]
+fn path_reports_dangling_link() {
+    let nb = temp();
+    link_dir(&nb.path().join("dangling"), &nb.path().join("gone"));
+    kladde()
+        .args(["path", "dangling/new.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .code(1)
+        .stderr(contains("cannot resolve"));
+}
+
+#[test]
+fn path_resolves_existing_note() {
+    let nb = temp();
+    fs::write(nb.path().join("note.md"), "").expect("fixture writes");
+    kladde()
+        .args(["path", "note.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success()
+        .stdout(format!(
+            "{}\n",
+            canonical(nb.path()).join("note.md").display()
+        ));
+}
+
+#[test]
+fn path_reports_unprobeable_component() {
+    let nb = temp();
+    let overlong = "a".repeat(300);
+    kladde()
+        .args(["path", &overlong, "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .code(1)
+        .stderr(contains("cannot resolve"));
+}
+
+#[cfg(unix)]
+#[test]
+fn path_reports_unreadable_directory() {
+    let nb = temp();
+    let locked = nb.path().join("locked");
+    fs::create_dir(&locked).expect("fixture dir creates");
+    set_mode(&locked, 0o000);
+    kladde()
+        .args(["path", "locked/new.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .code(1)
+        .stderr(contains("cannot resolve"));
+    set_mode(&locked, 0o755);
+}
+
+#[test]
+fn config_get_editor_exits_one_when_unset() {
+    let xdg = temp();
+    kladde_in(xdg.path())
+        .args(["config", "get", "editor"])
+        .assert()
+        .code(1)
+        .stdout("");
+}
+
+/// Only Linux allows non-Unicode names to exist, and only there does the
+/// lookup succeed; APFS refuses such names at lookup time.
+#[cfg(target_os = "linux")]
+#[test]
+fn path_prints_non_unicode_target_bytes() {
+    use std::ffi::OsString;
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    let nb = temp();
+    let target = OsString::from_vec(b"b\xFF.md".to_vec());
+    let assert = kladde()
+        .arg("path")
+        .arg(&target)
+        .arg("--notebook")
+        .arg(nb.path())
+        .assert()
+        .success();
+    let mut expected = canonical(nb.path())
+        .join(&target)
+        .as_os_str()
+        .as_bytes()
+        .to_vec();
+    expected.push(b'\n');
+    assert_eq!(assert.get_output().stdout, expected);
 }
