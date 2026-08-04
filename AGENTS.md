@@ -39,7 +39,9 @@ cargo deny check
 ```
 
 All seven must pass before a change is complete. These are the same commands CI
-runs, so a clean local run means a green build. `cargo cov-unit` and
+runs, so a clean local run means a green build. Specify every dependency in
+Cargo.toml out to patch (`major.minor.patch`), so the declared minimum is the
+version the code was actually built against. `cargo cov-unit` and
 `cargo cov-int` are aliases (see `.cargo/config.toml`) for `cargo llvm-cov`,
 enforcing 100% line coverage from unit tests alone and from integration tests
 alone. Clippy runs with `pedantic` warnings enabled and `-D warnings` so

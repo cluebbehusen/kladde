@@ -5,5 +5,6 @@
 //! state; the binary gathers inputs and passes them in.
 
 pub mod config;
+pub mod day;
 pub mod editor;
 pub mod notebook;
