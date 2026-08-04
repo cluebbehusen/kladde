@@ -39,9 +39,12 @@ pub struct Notebook {
     root: PathBuf,
 }
 
-/// The absolute path of a note proven to lie inside its notebook: a file
-/// that exists there or can be created there. The proof is point-in-time;
-/// code that writes through a `NotePath` later must tolerate or re-verify
+/// The absolute path of a note proven to lie inside its notebook. The
+/// proof is structural and point-in-time: containment is verified against
+/// the real filesystem, and no existing entry obstructs creating what is
+/// missing. It is not a promise that the filesystem will accept a create
+/// (name limits, permissions, space); those failures surface at write
+/// time. Code that writes through a `NotePath` must tolerate or re-verify
 /// concurrent filesystem changes.
 #[derive(Debug)]
 pub struct NotePath {
@@ -77,8 +80,8 @@ impl Notebook {
 
     /// Resolves `target`, a relative path inside the notebook, to the note
     /// it names. The note does not have to exist: the deepest existing
-    /// ancestor is canonicalized and checked for containment, and the rest
-    /// must be creatable under it.
+    /// ancestor is canonicalized and checked for containment, and no
+    /// existing entry may obstruct the rest.
     ///
     /// # Errors
     ///
