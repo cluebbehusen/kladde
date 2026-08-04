@@ -6,12 +6,21 @@ use std::path::{Path, PathBuf};
 
 use toml_edit::DocumentMut;
 
+use crate::day;
+
 /// Config key naming the notebook used when a command is not given an
 /// explicit notebook.
 pub const DEFAULT_NOTEBOOK: &str = "default-notebook";
 
 /// Config key naming the command that opens files in an editor.
 pub const EDITOR: &str = "editor";
+
+/// Config key naming the folder, inside the notebook, that holds daily
+/// notes.
+pub const DAILY_FOLDER: &str = "daily-folder";
+
+/// Config key naming the strftime format for daily note file names.
+pub const DAILY_DATE_FORMAT: &str = "daily-date-format";
 
 /// Settings read from the config file.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -20,6 +29,12 @@ pub struct Config {
     pub default_notebook: Option<PathBuf>,
     /// Command that opens files in an editor, split on whitespace when run.
     pub editor: Option<String>,
+    /// Folder inside the notebook that holds daily notes; unset means the
+    /// notebook root.
+    pub daily_folder: Option<PathBuf>,
+    /// strftime format for daily note file names; unset means
+    /// [`day::DEFAULT_FORMAT`].
+    pub daily_date_format: Option<day::Format>,
 }
 
 /// Failure while reading, validating, or writing the config file.
@@ -43,6 +58,12 @@ pub enum Error {
     NotAbsolute { key: &'static str, value: String },
     #[error("`editor` must contain a command")]
     EmptyEditor,
+    #[error("`{key}` must be a relative path, got \"{value}\"")]
+    NotRelative { key: &'static str, value: String },
+    #[error("`daily-folder` must not be empty")]
+    EmptyDailyFolder,
+    #[error("`daily-date-format`: {cause}")]
+    InvalidDateFormat { cause: day::Error },
     #[error("not a directory: {}", path.display())]
     NotADirectory { path: PathBuf },
     #[error("cannot create {}: {cause}", path.display())]
@@ -87,7 +108,9 @@ pub fn file(xdg_config_home: Option<PathBuf>, home: Option<PathBuf>) -> Option<P
 ///
 /// Returns an error when the file cannot be read, is not valid TOML, contains
 /// an unknown key, or holds a value of the wrong shape: `default-notebook`
-/// must be an absolute path and `editor` must contain a command.
+/// must be an absolute path, `editor` must contain a command, `daily-folder`
+/// must be a non-empty relative path, and `daily-date-format` must render a
+/// date.
 pub fn load(file: &Path) -> Result<Config, Error> {
     let document = read_document(file)?;
     let mut config = Config::default();
@@ -112,6 +135,20 @@ pub fn load(file: &Path) -> Result<Config, Error> {
                     return Err(Error::EmptyEditor);
                 }
                 config.editor = Some(value.to_owned());
+            }
+            DAILY_FOLDER => {
+                let value = item
+                    .as_str()
+                    .ok_or(Error::NotAString { key: DAILY_FOLDER })?;
+                config.daily_folder = Some(validated_daily_folder(value)?);
+            }
+            DAILY_DATE_FORMAT => {
+                let value = item.as_str().ok_or(Error::NotAString {
+                    key: DAILY_DATE_FORMAT,
+                })?;
+                let format =
+                    day::Format::new(value).map_err(|cause| Error::InvalidDateFormat { cause })?;
+                config.daily_date_format = Some(format);
             }
             unknown => {
                 return Err(Error::UnknownKey {
@@ -167,6 +204,54 @@ pub fn set_editor(file: &Path, editor: &str) -> Result<(), Error> {
     let mut document = read_document(file)?;
     document[EDITOR] = toml_edit::value(editor);
     save(file, &document)
+}
+
+/// Stores `folder` under the `daily-folder` key, creating the config file
+/// and its directory if needed and preserving the rest of the file,
+/// comments included.
+///
+/// # Errors
+///
+/// Returns an error when `folder` is empty or rooted, or when the config
+/// file cannot be read, parsed, or written back.
+pub fn set_daily_folder(file: &Path, folder: &str) -> Result<(), Error> {
+    validated_daily_folder(folder)?;
+    let mut document = read_document(file)?;
+    document[DAILY_FOLDER] = toml_edit::value(folder);
+    save(file, &document)
+}
+
+/// Stores `format` under the `daily-date-format` key, creating the config
+/// file and its directory if needed and preserving the rest of the file,
+/// comments included.
+///
+/// # Errors
+///
+/// Returns an error when `format` cannot render a date or renders an empty
+/// file name, or when the config file cannot be read, parsed, or written
+/// back.
+pub fn set_daily_date_format(file: &Path, format: &str) -> Result<(), Error> {
+    day::Format::new(format).map_err(|cause| Error::InvalidDateFormat { cause })?;
+    let mut document = read_document(file)?;
+    document[DAILY_DATE_FORMAT] = toml_edit::value(format);
+    save(file, &document)
+}
+
+/// A `daily-folder` value must name a place inside the notebook, so it has
+/// to be non-empty and relative; containment proper is enforced when the
+/// folder is resolved against a notebook.
+fn validated_daily_folder(value: &str) -> Result<PathBuf, Error> {
+    if value.is_empty() {
+        return Err(Error::EmptyDailyFolder);
+    }
+    let folder = PathBuf::from(value);
+    if folder.has_root() {
+        return Err(Error::NotRelative {
+            key: DAILY_FOLDER,
+            value: value.to_owned(),
+        });
+    }
+    Ok(folder)
 }
 
 /// Removes `key` from the config file, preserving the rest of the file,
@@ -491,6 +576,143 @@ mod tests {
         fs::create_dir(&notebook).expect("non-Unicode dir creates");
         let file = base.path().join("config.toml");
         let _ = set_default_notebook(&file, &notebook);
+    }
+
+    #[test]
+    fn load_reads_daily_keys() {
+        let base = temp();
+        let file = base.path().join("config.toml");
+        fs::write(
+            &file,
+            "daily-folder = 'Daily Notes'\ndaily-date-format = '%Y-%m-%d'\n",
+        )
+        .expect("fixture writes");
+        let config = load(&file).expect("fixture loads");
+        assert_eq!(config.daily_folder, Some(PathBuf::from("Daily Notes")));
+        assert_eq!(
+            config.daily_date_format,
+            Some(day::Format::new("%Y-%m-%d").expect("valid format"))
+        );
+    }
+
+    #[test]
+    fn load_rejects_non_string_daily_keys() {
+        let base = temp();
+        let file = base.path().join("config.toml");
+        fs::write(&file, "daily-folder = 3\n").expect("fixture writes");
+        let error = load(&file).expect_err("number fails");
+        assert!(
+            error
+                .to_string()
+                .contains("`daily-folder` must be a string")
+        );
+        fs::write(&file, "daily-date-format = 3\n").expect("fixture writes");
+        let error = load(&file).expect_err("number fails");
+        assert!(
+            error
+                .to_string()
+                .contains("`daily-date-format` must be a string")
+        );
+    }
+
+    #[test]
+    fn load_rejects_rooted_daily_folder() {
+        let base = temp();
+        let file = base.path().join("config.toml");
+        fs::write(&file, "daily-folder = '/daily'\n").expect("fixture writes");
+        let error = load(&file).expect_err("rooted folder fails");
+        assert!(
+            error
+                .to_string()
+                .contains("`daily-folder` must be a relative path")
+        );
+    }
+
+    #[test]
+    fn load_rejects_empty_daily_folder() {
+        let base = temp();
+        let file = base.path().join("config.toml");
+        fs::write(&file, "daily-folder = ''\n").expect("fixture writes");
+        let error = load(&file).expect_err("empty folder fails");
+        assert!(
+            error
+                .to_string()
+                .contains("`daily-folder` must not be empty")
+        );
+    }
+
+    #[test]
+    fn load_rejects_unknown_date_directive() {
+        let base = temp();
+        let file = base.path().join("config.toml");
+        fs::write(&file, "daily-date-format = '%Q'\n").expect("fixture writes");
+        let error = load(&file).expect_err("unknown directive fails");
+        assert!(error.to_string().contains("date format \"%Q\" is invalid"));
+    }
+
+    /// The probe is a date without a clock, so time-of-day directives are
+    /// rejected too.
+    #[test]
+    fn load_rejects_time_directive_in_date_format() {
+        let base = temp();
+        let file = base.path().join("config.toml");
+        fs::write(&file, "daily-date-format = '%Y-%H'\n").expect("fixture writes");
+        load(&file).expect_err("time directive fails");
+    }
+
+    #[test]
+    fn load_rejects_empty_date_format() {
+        let base = temp();
+        let file = base.path().join("config.toml");
+        fs::write(&file, "daily-date-format = ''\n").expect("fixture writes");
+        let error = load(&file).expect_err("empty format fails");
+        assert!(error.to_string().contains("renders an empty file name"));
+    }
+
+    #[test]
+    fn set_daily_folder_round_trips() {
+        let base = temp();
+        let file = base.path().join("config.toml");
+        set_daily_folder(&file, "Daily Notes").expect("set succeeds");
+        let config = load(&file).expect("written config loads");
+        assert_eq!(config.daily_folder, Some(PathBuf::from("Daily Notes")));
+    }
+
+    #[test]
+    fn set_daily_folder_rejects_rooted_path() {
+        let base = temp();
+        let file = base.path().join("config.toml");
+        set_daily_folder(&file, "/daily").expect_err("rooted folder fails");
+        assert!(!file.exists());
+    }
+
+    #[test]
+    fn set_daily_date_format_round_trips() {
+        let base = temp();
+        let file = base.path().join("config.toml");
+        set_daily_date_format(&file, "%Y/%m/%d").expect("set succeeds");
+        let config = load(&file).expect("written config loads");
+        assert_eq!(
+            config.daily_date_format,
+            Some(day::Format::new("%Y/%m/%d").expect("valid format"))
+        );
+    }
+
+    #[test]
+    fn set_daily_date_format_rejects_invalid_format() {
+        let base = temp();
+        let file = base.path().join("config.toml");
+        set_daily_date_format(&file, "%Q").expect_err("unknown directive fails");
+        assert!(!file.exists());
+    }
+
+    #[test]
+    fn set_daily_date_format_rejects_empty_format() {
+        let base = temp();
+        let file = base.path().join("config.toml");
+        let error = set_daily_date_format(&file, "").expect_err("empty format fails");
+        assert!(error.to_string().contains("renders an empty file name"));
+        assert!(!file.exists());
     }
 
     #[test]

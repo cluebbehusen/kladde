@@ -24,13 +24,29 @@ enum Command {
     /// Print the absolute path of a note.
     ///
     /// The note does not need to exist; the printed path is where it lives or
-    /// would be created inside the notebook.
+    /// would be created inside the notebook. With no target, the note is
+    /// today's daily note.
     Path {
-        /// The note, as a relative path inside the notebook.
-        target: PathBuf,
+        #[command(flatten)]
+        target: TargetArgs,
         #[command(flatten)]
         notebook: NotebookArg,
     },
+}
+
+/// The note a command operates on. The three forms are mutually exclusive;
+/// none of them means today's daily note.
+#[derive(Args)]
+#[group(multiple = false)]
+struct TargetArgs {
+    /// The note, as a relative path inside the notebook.
+    target: Option<PathBuf>,
+    /// The note, by name, resolved the way a wikilink is.
+    #[arg(long)]
+    name: Option<String>,
+    /// A daily note: today, yesterday, tomorrow, or YYYY-MM-DD.
+    #[arg(long, value_name = "WHEN")]
+    date: Option<String>,
 }
 
 /// The notebook selection shared by every command that reads or writes notes.
@@ -77,6 +93,10 @@ enum ConfigKey {
     DefaultNotebook,
     /// Command that opens files, for example `vim` or `code --wait`.
     Editor,
+    /// Folder inside the notebook that holds daily notes.
+    DailyFolder,
+    /// Date format for daily note file names, for example `%Y-%m-%d`.
+    DailyDateFormat,
 }
 
 impl ConfigKey {
@@ -84,6 +104,8 @@ impl ConfigKey {
         match self {
             Self::DefaultNotebook => kladde::config::DEFAULT_NOTEBOOK,
             Self::Editor => kladde::config::EDITOR,
+            Self::DailyFolder => kladde::config::DAILY_FOLDER,
+            Self::DailyDateFormat => kladde::config::DAILY_DATE_FORMAT,
         }
     }
 }
@@ -94,11 +116,28 @@ const NO_CONFIG_DIR: &str =
 fn main() -> ExitCode {
     match Cli::parse().command {
         Command::Config(command) => config(command),
-        Command::Path { target, notebook } => note_path(&target, notebook.notebook),
+        Command::Path { target, notebook } => note_path(target, notebook.notebook),
     }
 }
 
-fn note_path(target: &Path, flag: Option<PathBuf>) -> ExitCode {
+const NO_NOTEBOOK: &str = "no notebook: pass --notebook or set the default-notebook config key";
+
+fn note_path(target: TargetArgs, flag: Option<PathBuf>) -> ExitCode {
+    if let Some(relative) = target.target {
+        return with_notebook(flag, |notebook| notebook.note(&relative));
+    }
+    if let Some(name) = target.name {
+        return with_notebook(flag, |notebook| notebook.find(&name));
+    }
+    daily_note(target.date, flag)
+}
+
+/// Resolves the notebook root, opens it, and prints the note `resolve`
+/// picks inside it.
+fn with_notebook(
+    flag: Option<PathBuf>,
+    resolve: impl FnOnce(&kladde::notebook::Notebook) -> NoteResult,
+) -> ExitCode {
     let root = match notebook_root(flag) {
         Ok(root) => root,
         Err(message) => return fail(message),
@@ -107,12 +146,55 @@ fn note_path(target: &Path, flag: Option<PathBuf>) -> ExitCode {
         Ok(notebook) => notebook,
         Err(error) => return fail(error),
     };
-    match notebook.note(target) {
+    match resolve(&notebook) {
         Ok(note) => {
             print_path(note.as_path());
             ExitCode::SUCCESS
         }
         Err(error) => fail(error),
+    }
+}
+
+type NoteResult = Result<kladde::notebook::NotePath, kladde::notebook::Error>;
+
+/// A daily note needs the config even when `--notebook` is given, because
+/// the daily keys have no flag override, and printing a wrong path with a
+/// zero exit would be worse than failing.
+fn daily_note(date: Option<String>, flag: Option<PathBuf>) -> ExitCode {
+    let config = match daily_config(flag.is_some()) {
+        Ok(config) => config,
+        Err(message) => return fail(message),
+    };
+    let today = jiff::Zoned::now().date();
+    let day = match date {
+        Some(value) => match kladde::day::parse(&value, today) {
+            Ok(day) => day,
+            Err(error) => return fail(error),
+        },
+        None => today,
+    };
+    let Some(root) = flag.or(config.default_notebook) else {
+        return fail(NO_NOTEBOOK);
+    };
+    let format = config.daily_date_format.unwrap_or_default();
+    with_notebook(Some(root), |notebook| {
+        notebook.daily(day, config.daily_folder.as_deref(), &format)
+    })
+}
+
+/// The config a daily note draws its keys from. A missing file is an empty
+/// config; an unlocatable config directory is one too when `--notebook`
+/// pins the notebook, and an error otherwise, since the default notebook
+/// could only come from config.
+fn daily_config(explicit_notebook: bool) -> Result<kladde::config::Config, String> {
+    let file = kladde::config::file(
+        env::var_os("XDG_CONFIG_HOME").map(PathBuf::from),
+        env::var_os("HOME").map(PathBuf::from),
+    );
+    match file {
+        Some(file) => kladde::config::load(&file).map_err(|error| error.to_string()),
+        None if explicit_notebook => Ok(kladde::config::Config::default()),
+        None => Err(NO_CONFIG_DIR.to_owned()),
     }
 }
 
@@ -129,9 +211,9 @@ fn notebook_root(flag: Option<PathBuf>) -> Result<PathBuf, String> {
     )
     .ok_or_else(|| NO_CONFIG_DIR.to_owned())?;
     let config = kladde::config::load(&file).map_err(|error| error.to_string())?;
-    config.default_notebook.ok_or_else(|| {
-        "no notebook: pass --notebook or set the default-notebook config key".to_owned()
-    })
+    config
+        .default_notebook
+        .ok_or_else(|| NO_NOTEBOOK.to_owned())
 }
 
 fn config(command: ConfigCommand) -> ExitCode {
@@ -176,6 +258,22 @@ fn get(file: &Path, key: ConfigKey) -> ExitCode {
                 ExitCode::FAILURE
             }
         }
+        ConfigKey::DailyFolder => {
+            if let Some(folder) = config.daily_folder {
+                print_path(&folder);
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
+        }
+        ConfigKey::DailyDateFormat => {
+            if let Some(format) = config.daily_date_format {
+                println!("{}", format.as_str());
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
+        }
     }
 }
 
@@ -186,6 +284,8 @@ fn set(file: &Path, key: ConfigKey, value: &str) -> ExitCode {
             Err(error) => fail(format!("invalid path \"{value}\": {error}")),
         },
         ConfigKey::Editor => finish(kladde::config::set_editor(file, value)),
+        ConfigKey::DailyFolder => finish(kladde::config::set_daily_folder(file, value)),
+        ConfigKey::DailyDateFormat => finish(kladde::config::set_daily_date_format(file, value)),
     }
 }
 

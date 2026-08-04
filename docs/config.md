@@ -18,6 +18,12 @@ default-notebook = "/home/me/notes"
 
 # Command that opens files.
 editor = "code --wait"
+
+# Folder that holds daily notes. Unset means the notebook root.
+daily-folder = "Daily Notes"
+
+# strftime format for daily note file names. Unset means "%Y-%m-%d".
+daily-date-format = "%Y-%m-%d"
 ```
 
 Unknown keys are errors, so a typo fails loudly instead of silently doing
@@ -36,6 +42,17 @@ write notes take an explicit `--notebook` option; `--notebook` wins over
 Command that opens a file. The value is split on whitespace: the first token is
 the program, the rest are its arguments, and the file to open is appended.
 Arguments like `--wait` work. A program path containing spaces does not.
+
+### `daily-folder`
+
+Folder that holds daily notes, relative to the notebook root. Unset means daily
+notes live at the notebook root.
+
+### `daily-date-format`
+
+strftime format for daily note file names; `.md` is appended. Unset means
+`%Y-%m-%d`, so a note for August 4th, 2026 is `2026-08-04.md`. The format may
+contain `/` to spread daily notes across nested folders, for example `%Y/%m/%d`.
 
 ## Commands
 

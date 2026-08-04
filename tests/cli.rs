@@ -886,3 +886,415 @@ fn path_prints_non_unicode_target_bytes() {
     expected.push(b'\n');
     assert_eq!(assert.get_output().stdout, expected);
 }
+
+fn utc_today() -> jiff::civil::Date {
+    jiff::Timestamp::now()
+        .to_zoned(jiff::tz::TimeZone::UTC)
+        .date()
+}
+
+#[test]
+fn config_get_prints_daily_keys() {
+    let xdg = temp();
+    write_config(
+        xdg.path(),
+        "daily-folder = 'Journal'\ndaily-date-format = '%Y/%m/%d'\n",
+    );
+    kladde_in(xdg.path())
+        .args(["config", "get", "daily-folder"])
+        .assert()
+        .success()
+        .stdout("Journal\n");
+    kladde_in(xdg.path())
+        .args(["config", "get", "daily-date-format"])
+        .assert()
+        .success()
+        .stdout("%Y/%m/%d\n");
+}
+
+#[test]
+fn config_get_daily_keys_exit_one_when_unset() {
+    let xdg = temp();
+    kladde_in(xdg.path())
+        .args(["config", "get", "daily-folder"])
+        .assert()
+        .code(1)
+        .stdout("");
+    kladde_in(xdg.path())
+        .args(["config", "get", "daily-date-format"])
+        .assert()
+        .code(1)
+        .stdout("");
+}
+
+#[test]
+fn config_get_reports_rooted_daily_folder() {
+    let xdg = temp();
+    write_config(xdg.path(), "daily-folder = '/daily'\n");
+    kladde_in(xdg.path())
+        .args(["config", "get", "daily-folder"])
+        .assert()
+        .code(1)
+        .stderr(contains("`daily-folder` must be a relative path"));
+}
+
+#[test]
+fn config_get_reports_invalid_date_format() {
+    let xdg = temp();
+    write_config(xdg.path(), "daily-date-format = '%Q'\n");
+    kladde_in(xdg.path())
+        .args(["config", "get", "daily-date-format"])
+        .assert()
+        .code(1)
+        .stderr(contains("date format \"%Q\" is invalid"));
+}
+
+#[test]
+fn config_set_daily_keys_round_trip() {
+    let xdg = temp();
+    kladde_in(xdg.path())
+        .args(["config", "set", "daily-folder", "Daily Notes"])
+        .assert()
+        .success();
+    kladde_in(xdg.path())
+        .args(["config", "set", "daily-date-format", "%Y-%m-%d"])
+        .assert()
+        .success();
+    kladde_in(xdg.path())
+        .args(["config", "get", "daily-folder"])
+        .assert()
+        .success()
+        .stdout("Daily Notes\n");
+    kladde_in(xdg.path())
+        .args(["config", "get", "daily-date-format"])
+        .assert()
+        .success()
+        .stdout("%Y-%m-%d\n");
+}
+
+#[test]
+fn config_set_daily_folder_rejects_rooted_path() {
+    let xdg = temp();
+    kladde_in(xdg.path())
+        .args(["config", "set", "daily-folder", "/daily"])
+        .assert()
+        .code(1)
+        .stderr(contains("must be a relative path"));
+}
+
+#[test]
+fn config_set_daily_folder_rejects_empty_value() {
+    let xdg = temp();
+    kladde_in(xdg.path())
+        .args(["config", "set", "daily-folder", ""])
+        .assert()
+        .code(1)
+        .stderr(contains("`daily-folder` must not be empty"));
+}
+
+#[test]
+fn config_set_daily_date_format_rejects_invalid_format() {
+    let xdg = temp();
+    kladde_in(xdg.path())
+        .args(["config", "set", "daily-date-format", "%Q"])
+        .assert()
+        .code(1)
+        .stderr(contains("is invalid"));
+}
+
+#[test]
+fn config_set_daily_date_format_rejects_empty_value() {
+    let xdg = temp();
+    kladde_in(xdg.path())
+        .args(["config", "set", "daily-date-format", ""])
+        .assert()
+        .code(1)
+        .stderr(contains("renders an empty file name"));
+}
+
+#[test]
+fn config_unset_daily_keys() {
+    let xdg = temp();
+    write_config(
+        xdg.path(),
+        "daily-folder = 'Journal'\ndaily-date-format = '%Y/%m/%d'\n",
+    );
+    kladde_in(xdg.path())
+        .args(["config", "unset", "daily-folder"])
+        .assert()
+        .success();
+    kladde_in(xdg.path())
+        .args(["config", "unset", "daily-date-format"])
+        .assert()
+        .success();
+    kladde_in(xdg.path())
+        .args(["config", "get", "daily-folder"])
+        .assert()
+        .code(1);
+}
+
+#[test]
+fn path_defaults_to_todays_daily_note() {
+    let nb = temp();
+    let before = utc_today();
+    let assert = kladde()
+        .env("TZ", "UTC0")
+        .args(["path", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success();
+    let after = utc_today();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("stdout is UTF-8");
+    let expected = |day: jiff::civil::Date| {
+        format!(
+            "{}\n",
+            canonical(nb.path()).join(format!("{day}.md")).display()
+        )
+    };
+    assert!(stdout == expected(before) || stdout == expected(after));
+}
+
+#[test]
+fn path_resolves_date_keywords() {
+    use jiff::ToSpan;
+    let nb = temp();
+    let expected = |day: jiff::civil::Date| {
+        format!(
+            "{}\n",
+            canonical(nb.path()).join(format!("{day}.md")).display()
+        )
+    };
+    for (keyword, offset) in [("today", 0), ("yesterday", -1), ("tomorrow", 1)] {
+        let before = utc_today();
+        let assert = kladde()
+            .env("TZ", "UTC0")
+            .args(["path", "--date", keyword, "--notebook"])
+            .arg(nb.path())
+            .assert()
+            .success();
+        let after = utc_today();
+        let stdout =
+            String::from_utf8(assert.get_output().stdout.clone()).expect("stdout is UTF-8");
+        let low = expected(before.saturating_add(offset.days()));
+        let high = expected(after.saturating_add(offset.days()));
+        assert!(stdout == low || stdout == high, "keyword {keyword}");
+    }
+}
+
+#[test]
+fn path_resolves_dated_daily_note() {
+    let nb = temp();
+    kladde()
+        .args(["path", "--date", "2026-01-05", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success()
+        .stdout(format!(
+            "{}\n",
+            canonical(nb.path()).join("2026-01-05.md").display()
+        ));
+}
+
+#[test]
+fn path_reports_invalid_date() {
+    let nb = temp();
+    kladde()
+        .args(["path", "--date", "someday", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .code(1)
+        .stderr(contains("invalid date \"someday\""));
+}
+
+#[test]
+fn path_daily_uses_configured_folder_and_default_notebook() {
+    let xdg = temp();
+    let nb = temp();
+    write_config(
+        xdg.path(),
+        &format!(
+            "default-notebook = '{}'\ndaily-folder = 'Journal'\n",
+            nb.path().display()
+        ),
+    );
+    kladde_in(xdg.path())
+        .args(["path", "--date", "2026-01-05"])
+        .assert()
+        .success()
+        .stdout(format!(
+            "{}\n",
+            canonical(nb.path())
+                .join("Journal")
+                .join("2026-01-05.md")
+                .display()
+        ));
+}
+
+#[test]
+fn path_daily_uses_configured_format() {
+    let xdg = temp();
+    let nb = temp();
+    write_config(xdg.path(), "daily-date-format = '%Y/%m/%d'\n");
+    kladde_in(xdg.path())
+        .args(["path", "--date", "2026-01-05", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success()
+        .stdout(format!(
+            "{}\n",
+            canonical(nb.path())
+                .join("2026")
+                .join("01")
+                .join("05.md")
+                .display()
+        ));
+}
+
+#[test]
+fn path_daily_folder_stays_inside_the_notebook() {
+    let xdg = temp();
+    let nb = temp();
+    write_config(xdg.path(), "daily-folder = '..'\n");
+    kladde_in(xdg.path())
+        .args(["path", "--date", "2026-01-05", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .code(1)
+        .stderr(contains("cannot leave the notebook"));
+}
+
+#[test]
+fn path_daily_reports_broken_config_despite_flag() {
+    let xdg = temp();
+    let nb = temp();
+    write_config(xdg.path(), "not toml [\n");
+    kladde_in(xdg.path())
+        .args(["path", "--date", "2026-01-05", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .code(1)
+        .stderr(contains("invalid TOML"));
+}
+
+#[test]
+fn path_daily_works_without_config_base_given_flag() {
+    let nb = temp();
+    kladde()
+        .args(["path", "--date", "2026-01-05", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success();
+}
+
+#[test]
+fn path_daily_fails_without_config_base_or_flag() {
+    kladde()
+        .arg("path")
+        .assert()
+        .code(1)
+        .stderr(contains("cannot locate the config directory"));
+}
+
+#[test]
+fn path_daily_fails_without_any_notebook() {
+    let xdg = temp();
+    kladde_in(xdg.path())
+        .args(["path", "--date", "2026-01-05"])
+        .assert()
+        .code(1)
+        .stderr(contains("no notebook: pass --notebook"));
+}
+
+#[test]
+fn path_resolves_name() {
+    let nb = temp();
+    fs::create_dir(nb.path().join("sub")).expect("fixture dir creates");
+    fs::write(nb.path().join("sub").join("b.md"), "").expect("fixture writes");
+    fs::create_dir(nb.path().join(".hidden")).expect("fixture dir creates");
+    fs::write(nb.path().join(".hidden").join("b.md"), "").expect("fixture writes");
+    kladde()
+        .args(["path", "--name", "b", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success()
+        .stdout(format!(
+            "{}\n",
+            canonical(nb.path()).join("sub").join("b.md").display()
+        ));
+}
+
+#[test]
+fn path_reports_ambiguous_name() {
+    let nb = temp();
+    fs::write(nb.path().join("a.md"), "").expect("fixture writes");
+    fs::create_dir(nb.path().join("sub")).expect("fixture dir creates");
+    fs::write(nb.path().join("sub").join("a.md"), "").expect("fixture writes");
+    kladde()
+        .args(["path", "--name", "a", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .code(1)
+        .stderr(contains("multiple notes named \"a\""));
+}
+
+#[test]
+fn path_reports_missing_name() {
+    let nb = temp();
+    kladde()
+        .args(["path", "--name", "nope", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .code(1)
+        .stderr(contains("no note named \"nope\""));
+}
+
+#[test]
+fn path_rejects_empty_name() {
+    let nb = temp();
+    kladde()
+        .args(["path", "--name", "", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .code(1)
+        .stderr(contains("note target is empty"));
+}
+
+#[test]
+fn path_name_ignores_broken_config_with_flag() {
+    let xdg = temp();
+    let nb = temp();
+    fs::write(nb.path().join("a.md"), "").expect("fixture writes");
+    write_config(xdg.path(), "not toml [\n");
+    kladde_in(xdg.path())
+        .args(["path", "--name", "a", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success();
+}
+
+#[cfg(unix)]
+#[test]
+fn path_name_reports_unreadable_directory() {
+    let nb = temp();
+    let locked = nb.path().join("locked");
+    fs::create_dir(&locked).expect("fixture dir creates");
+    set_mode(&locked, 0o000);
+    kladde()
+        .args(["path", "--name", "a", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .code(1)
+        .stderr(contains("cannot resolve"));
+    set_mode(&locked, 0o755);
+}
+
+#[test]
+fn path_rejects_conflicting_targets() {
+    let nb = temp();
+    kladde()
+        .args(["path", "x.md", "--name", "y", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .code(2)
+        .stderr(contains("cannot be used with"));
+}
