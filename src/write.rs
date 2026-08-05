@@ -174,7 +174,9 @@ impl<'a> Guard<'a> {
     /// Reads the note (a missing note reads as empty), applies
     /// `transform` to its contents, and atomically replaces the note with
     /// the result, creating parent folders as needed. An existing note
-    /// keeps its permissions across the replacement.
+    /// keeps its permissions across the replacement, and both the note
+    /// and its folder are synced, so a reported write survives a power
+    /// cut.
     ///
     /// The new contents are written to a dot-prefixed temporary file in
     /// the note's own folder: the same filesystem, so the final rename is
@@ -227,10 +229,7 @@ impl<'a> Guard<'a> {
             .and_then(|file| write_note(file, permissions, new.as_bytes()))
             .map_err(write_error(&temp))?;
         fs::rename(&temp, path).map_err(write_error(path))?;
-        // Best-effort folder sync, so a crash right after the rename
-        // cannot undo it. Opening a directory fails on Windows, where
-        // this degrades to a no-op.
-        let _ = File::open(folder).and_then(|dir| dir.sync_all());
+        sync_folder(folder).map_err(write_error(folder))?;
         Ok(())
     }
 }
@@ -248,6 +247,30 @@ fn write_note(
     }
     file.write_all(bytes)?;
     file.sync_all()
+}
+
+/// Forces the folder's entries to disk, making a just-renamed note
+/// durable: the rename rewrote the folder's own data, and until that
+/// reaches disk a power cut can revert a reported append even though the
+/// note's contents are synced.
+#[cfg(unix)]
+fn sync_folder(folder: &Path) -> std::io::Result<()> {
+    File::open(folder)?.sync_all()
+}
+
+/// Windows refuses to open a directory unless the handle asks for backup
+/// semantics, and the flush behind `sync_all` needs write access; with
+/// both, the same flush works.
+#[cfg(windows)]
+fn sync_folder(folder: &Path) -> std::io::Result<()> {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    File::options()
+        .read(true)
+        .write(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(folder)?
+        .sync_all()
 }
 
 impl Drop for Guard<'_> {
