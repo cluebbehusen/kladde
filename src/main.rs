@@ -32,6 +32,24 @@ enum Command {
         #[command(flatten)]
         notebook: NotebookArg,
     },
+    /// Append text to the end of a note.
+    ///
+    /// The text is appended verbatim as its own line, so a bullet is
+    /// whatever you type. The note is created if it does not exist, parent
+    /// folders included, except that a note targeted by name must already
+    /// exist. With no target, the note is today's daily note. Writes take
+    /// a per-note lock and replace the note atomically, so concurrent
+    /// appends never lose an entry.
+    Append {
+        /// Text to append, verbatim. Text spelled exactly like an option
+        /// of this command needs a `--` separator first.
+        #[arg(allow_hyphen_values = true)]
+        text: String,
+        #[command(flatten)]
+        target: TargetArgs,
+        #[command(flatten)]
+        notebook: NotebookArg,
+    },
 }
 
 /// The note a command operates on. The three forms are mutually exclusive;
@@ -116,27 +134,63 @@ const NO_CONFIG_DIR: &str =
 fn main() -> ExitCode {
     match Cli::parse().command {
         Command::Config(command) => config(command),
-        Command::Path { target, notebook } => note_path(target, notebook.notebook),
+        Command::Path { target, notebook } => dispatch(target, notebook.notebook, |note| {
+            print_path(note.as_path());
+            ExitCode::SUCCESS
+        }),
+        Command::Append {
+            text,
+            target,
+            notebook,
+        } => append(&text, target, notebook.notebook),
     }
 }
 
 const NO_NOTEBOOK: &str = "no notebook: pass --notebook or set the default-notebook config key";
 
-fn note_path(target: TargetArgs, flag: Option<PathBuf>) -> ExitCode {
+const NO_STATE_DIR: &str =
+    "cannot locate the state directory: neither XDG_STATE_HOME nor HOME is set";
+
+/// Resolves the note a command targets and runs `act` on it.
+fn dispatch(
+    target: TargetArgs,
+    flag: Option<PathBuf>,
+    act: impl FnOnce(&Note) -> ExitCode,
+) -> ExitCode {
     if let Some(relative) = target.target {
-        return with_notebook(flag, |notebook| notebook.note(&relative));
+        return with_notebook(flag, |notebook| notebook.note(&relative), act);
     }
     if let Some(name) = target.name {
-        return with_notebook(flag, |notebook| notebook.find(&name));
+        return with_notebook(flag, |notebook| notebook.find(&name), act);
     }
-    daily_note(target.date, flag)
+    daily_note(target.date, flag, act)
 }
 
-/// Resolves the notebook root, opens it, and prints the note `resolve`
-/// picks inside it.
+fn append(text: &str, target: TargetArgs, flag: Option<PathBuf>) -> ExitCode {
+    let locks = kladde::write::lock_dir(
+        env::var_os("XDG_STATE_HOME").map(PathBuf::from),
+        env::var_os("HOME").map(PathBuf::from),
+    );
+    let Some(locks) = locks else {
+        return fail(NO_STATE_DIR);
+    };
+    dispatch(target, flag, |note| {
+        match kladde::write::append(&locks, note, text) {
+            Ok(()) => {
+                print_path(note.as_path());
+                ExitCode::SUCCESS
+            }
+            Err(error) => fail(error),
+        }
+    })
+}
+
+/// Resolves the notebook root, opens it, and runs `act` on the note
+/// `resolve` picks inside it.
 fn with_notebook(
     flag: Option<PathBuf>,
-    resolve: impl FnOnce(&kladde::notebook::Notebook) -> NoteResult,
+    resolve: impl FnOnce(&kladde::notebook::Notebook) -> Result<Note, kladde::notebook::Error>,
+    act: impl FnOnce(&Note) -> ExitCode,
 ) -> ExitCode {
     let root = match notebook_root(flag) {
         Ok(root) => root,
@@ -147,20 +201,21 @@ fn with_notebook(
         Err(error) => return fail(error),
     };
     match resolve(&notebook) {
-        Ok(note) => {
-            print_path(note.as_path());
-            ExitCode::SUCCESS
-        }
+        Ok(note) => act(&note),
         Err(error) => fail(error),
     }
 }
 
-type NoteResult = Result<kladde::notebook::NotePath, kladde::notebook::Error>;
+type Note = kladde::notebook::NotePath;
 
 /// A daily note needs the config even when `--notebook` is given, because
 /// the daily keys have no flag override, and printing a wrong path with a
 /// zero exit would be worse than failing.
-fn daily_note(date: Option<String>, flag: Option<PathBuf>) -> ExitCode {
+fn daily_note(
+    date: Option<String>,
+    flag: Option<PathBuf>,
+    act: impl FnOnce(&Note) -> ExitCode,
+) -> ExitCode {
     let config = match daily_config(flag.is_some()) {
         Ok(config) => config,
         Err(message) => return fail(message),
@@ -177,9 +232,11 @@ fn daily_note(date: Option<String>, flag: Option<PathBuf>) -> ExitCode {
         return fail(NO_NOTEBOOK);
     };
     let format = config.daily_date_format.unwrap_or_default();
-    with_notebook(Some(root), |notebook| {
-        notebook.daily(day, config.daily_folder.as_deref(), &format)
-    })
+    with_notebook(
+        Some(root),
+        |notebook| notebook.daily(day, config.daily_folder.as_deref(), &format),
+        act,
+    )
 }
 
 /// The config a daily note draws its keys from. A missing file is an empty

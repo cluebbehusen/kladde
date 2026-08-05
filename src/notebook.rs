@@ -74,6 +74,7 @@ pub struct Notebook {
 #[derive(Debug)]
 pub struct NotePath {
     absolute: PathBuf,
+    root: PathBuf,
 }
 
 impl NotePath {
@@ -81,6 +82,36 @@ impl NotePath {
     #[must_use]
     pub fn as_path(&self) -> &Path {
         &self.absolute
+    }
+
+    /// The folder that holds the note.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the path has no parent, which construction rules out: a
+    /// note always lies inside its notebook's root.
+    pub(crate) fn folder(&self) -> &Path {
+        self.absolute
+            .parent()
+            .expect("a note lies inside its notebook")
+    }
+
+    /// The canonical root of the notebook the note was resolved in.
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// The note's path relative to its notebook root.
+    ///
+    /// # Panics
+    ///
+    /// Panics when the path does not start with the root, which
+    /// construction rules out: a note always lies inside its notebook's
+    /// root.
+    pub(crate) fn relative(&self) -> &Path {
+        self.absolute
+            .strip_prefix(&self.root)
+            .expect("a note lies inside its notebook")
     }
 }
 
@@ -169,10 +200,14 @@ impl Notebook {
             if !resolved.is_file() {
                 return Err(Error::NotAFile { path: resolved });
             }
-            Ok(NotePath { absolute: resolved })
+            Ok(NotePath {
+                absolute: resolved,
+                root: self.root.clone(),
+            })
         } else if resolved.is_dir() {
             Ok(NotePath {
                 absolute: resolved.join(remainder),
+                root: self.root.clone(),
             })
         } else {
             Err(Error::NotADirectory { path: resolved })
@@ -227,6 +262,7 @@ impl Notebook {
         match matches.pop() {
             Some(found) => Ok(NotePath {
                 absolute: self.root.join(found),
+                root: self.root.clone(),
             }),
             None => Err(Error::NoSuchName {
                 name: stem.to_owned(),

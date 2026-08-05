@@ -28,6 +28,13 @@ fn kladde_in(xdg: &Path) -> Command {
     command
 }
 
+/// A `kladde` command whose lock files live under the given `XDG_STATE_HOME`.
+fn kladde_state(state: &Path) -> Command {
+    let mut command = kladde();
+    command.env("XDG_STATE_HOME", state);
+    command
+}
+
 fn temp() -> TempDir {
     TempDir::new().expect("temp dir creates")
 }
@@ -1297,4 +1304,409 @@ fn path_rejects_conflicting_targets() {
         .assert()
         .code(2)
         .stderr(contains("cannot be used with"));
+}
+
+#[test]
+fn append_creates_a_missing_note() {
+    let nb = temp();
+    let state = temp();
+    kladde_state(state.path())
+        .args(["append", "- first", "notes/new.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success()
+        .stdout(format!(
+            "{}\n",
+            canonical(nb.path()).join("notes").join("new.md").display()
+        ));
+    let contents = fs::read_to_string(nb.path().join("notes").join("new.md")).expect("note reads");
+    assert_eq!(contents, "- first\n");
+}
+
+#[test]
+fn append_appends_to_an_existing_note() {
+    let nb = temp();
+    let state = temp();
+    fs::write(nb.path().join("x.md"), "start\n").expect("fixture writes");
+    kladde_state(state.path())
+        .args(["append", "- next", "x.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success();
+    let contents = fs::read_to_string(nb.path().join("x.md")).expect("note reads");
+    assert_eq!(contents, "start\n- next\n");
+}
+
+#[test]
+fn append_inserts_a_missing_separator() {
+    let nb = temp();
+    let state = temp();
+    fs::write(nb.path().join("x.md"), "no newline").expect("fixture writes");
+    kladde_state(state.path())
+        .args(["append", "- next", "x.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success();
+    let contents = fs::read_to_string(nb.path().join("x.md")).expect("note reads");
+    assert_eq!(contents, "no newline\n- next\n");
+}
+
+#[test]
+fn append_strips_trailing_newlines_from_the_text() {
+    let nb = temp();
+    let state = temp();
+    kladde_state(state.path())
+        .args(["append", "- entry\n\n", "x.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success();
+    let contents = fs::read_to_string(nb.path().join("x.md")).expect("note reads");
+    assert_eq!(contents, "- entry\n");
+}
+
+#[test]
+fn append_keeps_interior_newlines() {
+    let nb = temp();
+    let state = temp();
+    kladde_state(state.path())
+        .args(["append", "- parent\n\t- child", "x.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success();
+    let contents = fs::read_to_string(nb.path().join("x.md")).expect("note reads");
+    assert_eq!(contents, "- parent\n\t- child\n");
+}
+
+#[test]
+fn append_accepts_flags_before_the_text() {
+    let nb = temp();
+    let state = temp();
+    kladde_state(state.path())
+        .arg("append")
+        .arg("--notebook")
+        .arg(nb.path())
+        .args(["- dashed", "x.md"])
+        .assert()
+        .success();
+    let contents = fs::read_to_string(nb.path().join("x.md")).expect("note reads");
+    assert_eq!(contents, "- dashed\n");
+}
+
+/// After a `--`, even text spelled exactly like an option is a positional.
+#[test]
+fn append_accepts_option_shaped_text_after_a_separator() {
+    let nb = temp();
+    let state = temp();
+    kladde_state(state.path())
+        .arg("append")
+        .arg("--notebook")
+        .arg(nb.path())
+        .args(["--", "--name", "x.md"])
+        .assert()
+        .success();
+    let contents = fs::read_to_string(nb.path().join("x.md")).expect("note reads");
+    assert_eq!(contents, "--name\n");
+}
+
+#[test]
+fn append_rejects_empty_text() {
+    let nb = temp();
+    let state = temp();
+    kladde_state(state.path())
+        .args(["append", "", "x.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .code(1)
+        .stderr(contains("nothing to append"));
+    assert!(!nb.path().join("x.md").exists());
+}
+
+#[test]
+fn append_requires_text() {
+    kladde()
+        .arg("append")
+        .assert()
+        .code(2)
+        .stderr(contains("Usage"));
+}
+
+#[test]
+fn append_rejects_conflicting_targets() {
+    let nb = temp();
+    kladde()
+        .args(["append", "- x", "x.md", "--name", "y", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .code(2)
+        .stderr(contains("cannot be used with"));
+}
+
+#[test]
+fn append_resolves_name() {
+    let nb = temp();
+    let state = temp();
+    fs::create_dir(nb.path().join("sub")).expect("fixture dir creates");
+    fs::write(nb.path().join("sub").join("b.md"), "start\n").expect("fixture writes");
+    kladde_state(state.path())
+        .args(["append", "- found", "--name", "b", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success()
+        .stdout(format!(
+            "{}\n",
+            canonical(nb.path()).join("sub").join("b.md").display()
+        ));
+    let contents = fs::read_to_string(nb.path().join("sub").join("b.md")).expect("note reads");
+    assert_eq!(contents, "start\n- found\n");
+}
+
+/// A note targeted by name must already exist: there is no path to create.
+#[test]
+fn append_missing_name_creates_nothing() {
+    let nb = temp();
+    let state = temp();
+    kladde_state(state.path())
+        .args(["append", "- x", "--name", "nope", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .code(1)
+        .stderr(contains("no note named \"nope\""));
+    let entries = fs::read_dir(nb.path()).expect("notebook reads");
+    assert_eq!(entries.count(), 0);
+}
+
+#[test]
+fn append_daily_uses_configured_folder_and_format() {
+    let xdg = temp();
+    let nb = temp();
+    let state = temp();
+    write_config(
+        xdg.path(),
+        &format!(
+            "default-notebook = '{}'\ndaily-folder = 'Journal'\ndaily-date-format = '%Y/%m/%d'\n",
+            nb.path().display()
+        ),
+    );
+    kladde_in(xdg.path())
+        .env("XDG_STATE_HOME", state.path())
+        .args(["append", "- daily", "--date", "2026-01-05"])
+        .assert()
+        .success();
+    let note = nb
+        .path()
+        .join("Journal")
+        .join("2026")
+        .join("01")
+        .join("05.md");
+    let contents = fs::read_to_string(note).expect("note reads");
+    assert_eq!(contents, "- daily\n");
+}
+
+#[test]
+fn append_daily_works_without_config_base_given_flag() {
+    let nb = temp();
+    let state = temp();
+    kladde_state(state.path())
+        .args(["append", "- daily", "--date", "2026-01-05", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success();
+    let contents = fs::read_to_string(nb.path().join("2026-01-05.md")).expect("note reads");
+    assert_eq!(contents, "- daily\n");
+}
+
+#[test]
+fn append_daily_reports_broken_config_despite_flag() {
+    let xdg = temp();
+    let nb = temp();
+    let state = temp();
+    write_config(xdg.path(), "not toml [\n");
+    kladde_in(xdg.path())
+        .env("XDG_STATE_HOME", state.path())
+        .args(["append", "- x", "--date", "today", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .code(1)
+        .stderr(contains("invalid TOML"));
+}
+
+#[test]
+fn append_fails_without_state_base() {
+    let nb = temp();
+    kladde()
+        .args(["append", "- x", "x.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .code(1)
+        .stderr(contains("cannot locate the state directory"));
+}
+
+#[test]
+fn append_falls_back_to_home_state() {
+    let nb = temp();
+    let home = temp();
+    kladde()
+        .env("HOME", home.path())
+        .args(["append", "- x", "x.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success();
+    let locks = home
+        .path()
+        .join(".local")
+        .join("state")
+        .join("kladde")
+        .join("locks");
+    let entries = fs::read_dir(locks).expect("locks dir reads");
+    assert_eq!(entries.count(), 1);
+}
+
+#[test]
+fn append_rejects_a_note_that_is_not_utf8() {
+    let nb = temp();
+    let state = temp();
+    fs::write(nb.path().join("x.md"), [0xff, 0xfe, 0xfd]).expect("fixture writes");
+    kladde_state(state.path())
+        .args(["append", "- x", "x.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .code(1)
+        .stderr(contains("cannot read"));
+}
+
+#[test]
+fn append_reports_an_obstructed_lock_dir() {
+    let nb = temp();
+    let state = temp();
+    fs::create_dir(state.path().join("kladde")).expect("fixture dir creates");
+    fs::write(state.path().join("kladde").join("locks"), "").expect("fixture writes");
+    kladde_state(state.path())
+        .args(["append", "- x", "x.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .code(1)
+        .stderr(contains("cannot create lock directory"));
+}
+
+#[test]
+fn append_reports_an_obstructed_lock_file() {
+    let nb = temp();
+    let state = temp();
+    kladde_state(state.path())
+        .args(["append", "- x", "x.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success();
+    let locks = state.path().join("kladde").join("locks");
+    let lock_file = fs::read_dir(&locks)
+        .expect("locks dir reads")
+        .next()
+        .expect("a lock file exists")
+        .expect("entry reads")
+        .path();
+    fs::remove_file(&lock_file).expect("lock file removes");
+    fs::create_dir(&lock_file).expect("fixture dir creates");
+    kladde_state(state.path())
+        .args(["append", "- y", "x.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .code(1)
+        .stderr(contains("cannot lock"));
+}
+
+/// The temporary file name for a note named `x.md`, pinned by the
+/// `temp_name_is_stable` unit test.
+const TEMP_X: &str = ".72d8d45320ac7f62.kladde-tmp";
+
+#[test]
+fn append_reports_an_obstructed_temp_path() {
+    let nb = temp();
+    let state = temp();
+    fs::create_dir(nb.path().join(TEMP_X)).expect("fixture dir creates");
+    kladde_state(state.path())
+        .args(["append", "- x", "x.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .code(1)
+        .stderr(contains("cannot write"));
+}
+
+/// A link planted at the temporary path is deleted, never followed: the
+/// append succeeds without touching what the link pointed at.
+#[cfg(unix)]
+#[test]
+fn append_ignores_a_planted_temp_link() {
+    let nb = temp();
+    let state = temp();
+    let outside = temp();
+    let precious = outside.path().join("precious");
+    fs::write(&precious, "untouched").expect("fixture writes");
+    std::os::unix::fs::symlink(&precious, nb.path().join(TEMP_X)).expect("symlink creates");
+    kladde_state(state.path())
+        .args(["append", "- x", "x.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success();
+    assert_eq!(
+        fs::read_to_string(&precious).expect("outside file reads"),
+        "untouched"
+    );
+    let contents = fs::read_to_string(nb.path().join("x.md")).expect("note reads");
+    assert_eq!(contents, "- x\n");
+}
+
+/// `path` reports where a note would live without creating it; only
+/// `append` creates.
+#[test]
+fn path_creates_nothing() {
+    let nb = temp();
+    kladde()
+        .args(["path", "missing.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success();
+    assert!(!nb.path().join("missing.md").exists());
+}
+
+/// The stress test doubles as the create-if-missing race test: all
+/// writers start behind a barrier and the first round races to create the
+/// note.
+#[test]
+fn append_concurrent_writers_lose_nothing() {
+    const WRITERS: usize = 8;
+    const ENTRIES: usize = 5;
+    let nb = temp();
+    let state = temp();
+    let barrier = std::sync::Barrier::new(WRITERS);
+    std::thread::scope(|scope| {
+        for writer in 0..WRITERS {
+            let (barrier, nb, state) = (&barrier, nb.path(), state.path());
+            scope.spawn(move || {
+                barrier.wait();
+                for entry in 0..ENTRIES {
+                    kladde_state(state)
+                        .args([
+                            "append",
+                            &format!("- w{writer}e{entry}"),
+                            "--date",
+                            "2026-01-05",
+                            "--notebook",
+                        ])
+                        .arg(nb)
+                        .assert()
+                        .success();
+                }
+            });
+        }
+    });
+    let contents = fs::read_to_string(nb.path().join("2026-01-05.md")).expect("note reads");
+    assert_eq!(contents.lines().count(), WRITERS * ENTRIES);
+    let lines: std::collections::HashSet<&str> = contents.lines().collect();
+    for writer in 0..WRITERS {
+        for entry in 0..ENTRIES {
+            assert!(lines.contains(format!("- w{writer}e{entry}").as_str()));
+        }
+    }
+    assert!(contents.ends_with('\n'));
+    assert!(!contents.contains("\n\n"));
 }

@@ -2,6 +2,7 @@
 name = "kladde"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.89"
 description = "CLI for a local markdown notebook: daily notes, generic notes, and section-aware appends that are safe under concurrent writers"
 repository = "https://github.com/cluebbehusen/kladde"
 license = "MIT"
