@@ -2,7 +2,7 @@
 
 use std::fs;
 use std::io::ErrorKind;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use toml_edit::DocumentMut;
 
@@ -22,6 +22,24 @@ pub const DAILY_FOLDER: &str = "daily-folder";
 /// Config key naming the strftime format for daily note file names.
 pub const DAILY_DATE_FORMAT: &str = "daily-date-format";
 
+/// Config key switching created/updated stamping on or off.
+pub const STAMP: &str = "stamp";
+
+/// Config key naming the property that records when kladde created a
+/// note's frontmatter block.
+pub const STAMP_CREATED_KEY: &str = "stamp-created-key";
+
+/// Config key naming the property that records when kladde last wrote
+/// the note.
+pub const STAMP_UPDATED_KEY: &str = "stamp-updated-key";
+
+/// Config key naming the strftime format for stamp values.
+pub const STAMP_FORMAT: &str = "stamp-format";
+
+/// Config key listing notebook-relative paths whose notes are never
+/// stamped.
+pub const STAMP_EXCLUDE: &str = "stamp-exclude";
+
 /// Settings read from the config file.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Config {
@@ -35,6 +53,18 @@ pub struct Config {
     /// strftime format for daily note file names; unset means
     /// [`day::DEFAULT_FORMAT`].
     pub daily_date_format: Option<day::Format>,
+    /// Whether writes stamp created/updated properties; unset means true.
+    pub stamp: Option<bool>,
+    /// Property name for the created stamp; unset means `created`.
+    pub stamp_created_key: Option<String>,
+    /// Property name for the updated stamp; unset means `updated`.
+    pub stamp_updated_key: Option<String>,
+    /// strftime format for stamp values; unset means
+    /// [`day::DEFAULT_STAMP_FORMAT`].
+    pub stamp_format: Option<day::StampFormat>,
+    /// Notebook-relative paths whose notes are never stamped; unset means
+    /// none.
+    pub stamp_exclude: Option<Vec<PathBuf>>,
 }
 
 /// Failure while reading, validating, or writing the config file.
@@ -64,6 +94,23 @@ pub enum Error {
     EmptyDailyFolder,
     #[error("`daily-date-format`: {cause}")]
     InvalidDateFormat { cause: day::Error },
+    #[error("`{key}` must be true or false")]
+    NotABoolean { key: &'static str },
+    #[error("`{key}`: {cause}")]
+    InvalidStampKey {
+        key: &'static str,
+        cause: crate::frontmatter::Error,
+    },
+    #[error("`stamp-format`: {cause}")]
+    InvalidStampFormat { cause: day::Error },
+    #[error("`{key}` must be an array of strings")]
+    NotAnArray { key: &'static str },
+    #[error("`stamp-exclude` entries must be relative paths, got \"{value}\"")]
+    RootedExclude { value: String },
+    #[error("`stamp-exclude` entries must not be empty")]
+    EmptyExclude,
+    #[error("`stamp-exclude` entries must name a place inside the notebook, got \"{value}\"")]
+    EscapingExclude { value: String },
     #[error("not a directory: {}", path.display())]
     NotADirectory { path: PathBuf },
     #[error("cannot create {}: {cause}", path.display())]
@@ -150,6 +197,42 @@ pub fn load(file: &Path) -> Result<Config, Error> {
                     day::Format::new(value).map_err(|cause| Error::InvalidDateFormat { cause })?;
                 config.daily_date_format = Some(format);
             }
+            STAMP => {
+                config.stamp = Some(item.as_bool().ok_or(Error::NotABoolean { key: STAMP })?);
+            }
+            STAMP_CREATED_KEY => {
+                let value = item.as_str().ok_or(Error::NotAString {
+                    key: STAMP_CREATED_KEY,
+                })?;
+                config.stamp_created_key = Some(validated_stamp_key(STAMP_CREATED_KEY, value)?);
+            }
+            STAMP_UPDATED_KEY => {
+                let value = item.as_str().ok_or(Error::NotAString {
+                    key: STAMP_UPDATED_KEY,
+                })?;
+                config.stamp_updated_key = Some(validated_stamp_key(STAMP_UPDATED_KEY, value)?);
+            }
+            STAMP_FORMAT => {
+                let value = item
+                    .as_str()
+                    .ok_or(Error::NotAString { key: STAMP_FORMAT })?;
+                let format = day::StampFormat::new(value)
+                    .map_err(|cause| Error::InvalidStampFormat { cause })?;
+                config.stamp_format = Some(format);
+            }
+            STAMP_EXCLUDE => {
+                let array = item
+                    .as_array()
+                    .ok_or(Error::NotAnArray { key: STAMP_EXCLUDE })?;
+                let mut entries = Vec::new();
+                for element in array {
+                    let value = element
+                        .as_str()
+                        .ok_or(Error::NotAnArray { key: STAMP_EXCLUDE })?;
+                    entries.push(validated_exclude(value)?);
+                }
+                config.stamp_exclude = Some(entries);
+            }
             unknown => {
                 return Err(Error::UnknownKey {
                     path: file.to_owned(),
@@ -235,6 +318,136 @@ pub fn set_daily_date_format(file: &Path, format: &str) -> Result<(), Error> {
     let mut document = read_document(file)?;
     document[DAILY_DATE_FORMAT] = toml_edit::value(format);
     save(file, &document)
+}
+
+/// Stores `value` under the `stamp` key, creating the config file and its
+/// directory if needed and preserving the rest of the file, comments
+/// included.
+///
+/// # Errors
+///
+/// Returns an error when `value` is not `true` or `false`, or when the
+/// config file cannot be read, parsed, or written back.
+pub fn set_stamp(file: &Path, value: &str) -> Result<(), Error> {
+    let stamp = match value {
+        "true" => true,
+        "false" => false,
+        _ => return Err(Error::NotABoolean { key: STAMP }),
+    };
+    let mut document = read_document(file)?;
+    document[STAMP] = toml_edit::value(stamp);
+    save(file, &document)
+}
+
+/// Stores `value` under the `stamp-created-key` key, creating the config
+/// file and its directory if needed and preserving the rest of the file,
+/// comments included.
+///
+/// # Errors
+///
+/// Returns an error when `value` cannot name a property, or when the
+/// config file cannot be read, parsed, or written back.
+pub fn set_stamp_created_key(file: &Path, value: &str) -> Result<(), Error> {
+    validated_stamp_key(STAMP_CREATED_KEY, value)?;
+    let mut document = read_document(file)?;
+    document[STAMP_CREATED_KEY] = toml_edit::value(value);
+    save(file, &document)
+}
+
+/// Stores `value` under the `stamp-updated-key` key, creating the config
+/// file and its directory if needed and preserving the rest of the file,
+/// comments included.
+///
+/// # Errors
+///
+/// Returns an error when `value` cannot name a property, or when the
+/// config file cannot be read, parsed, or written back.
+pub fn set_stamp_updated_key(file: &Path, value: &str) -> Result<(), Error> {
+    validated_stamp_key(STAMP_UPDATED_KEY, value)?;
+    let mut document = read_document(file)?;
+    document[STAMP_UPDATED_KEY] = toml_edit::value(value);
+    save(file, &document)
+}
+
+/// Stores `value` under the `stamp-format` key, creating the config file
+/// and its directory if needed and preserving the rest of the file,
+/// comments included.
+///
+/// # Errors
+///
+/// Returns an error when `value` cannot render a datetime to a non-empty
+/// single line, or when the config file cannot be read, parsed, or
+/// written back.
+pub fn set_stamp_format(file: &Path, value: &str) -> Result<(), Error> {
+    day::StampFormat::new(value).map_err(|cause| Error::InvalidStampFormat { cause })?;
+    let mut document = read_document(file)?;
+    document[STAMP_FORMAT] = toml_edit::value(value);
+    save(file, &document)
+}
+
+/// Stores the comma-separated `value` under the `stamp-exclude` key as a
+/// TOML array, creating the config file and its directory if needed and
+/// preserving the rest of the file, comments included. Whitespace around
+/// each entry is dropped; an entry containing a comma can only be written
+/// by editing the file directly.
+///
+/// # Errors
+///
+/// Returns an error when an entry is empty or rooted, or when the config
+/// file cannot be read, parsed, or written back.
+pub fn set_stamp_exclude(file: &Path, value: &str) -> Result<(), Error> {
+    let mut array = toml_edit::Array::new();
+    for entry in value.split(',') {
+        let entry = entry.trim();
+        validated_exclude(entry)?;
+        array.push(entry);
+    }
+    let mut document = read_document(file)?;
+    document[STAMP_EXCLUDE] = toml_edit::value(array);
+    save(file, &document)
+}
+
+/// A stamp key must be writable as a property by the frontmatter module,
+/// which shares its key rules with every property edit.
+fn validated_stamp_key(key: &'static str, value: &str) -> Result<String, Error> {
+    crate::frontmatter::validated_key(value)
+        .map_err(|cause| Error::InvalidStampKey { key, cause })?;
+    Ok(value.to_owned())
+}
+
+/// A `stamp-exclude` entry must name a place inside the notebook, so it
+/// has to be non-empty and relative, like `daily-folder`. Entries are
+/// normalized to plain components, because exclusion matches a note's
+/// notebook-relative path component by component: a `./` would never
+/// match anything, and a `..` could only name a place outside.
+fn validated_exclude(value: &str) -> Result<PathBuf, Error> {
+    if value.is_empty() {
+        return Err(Error::EmptyExclude);
+    }
+    let path = PathBuf::from(value);
+    if path.has_root() {
+        return Err(Error::RootedExclude {
+            value: value.to_owned(),
+        });
+    }
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(part) => normalized.push(part),
+            Component::CurDir => {}
+            _ => {
+                return Err(Error::EscapingExclude {
+                    value: value.to_owned(),
+                });
+            }
+        }
+    }
+    if normalized.as_os_str().is_empty() {
+        return Err(Error::EscapingExclude {
+            value: value.to_owned(),
+        });
+    }
+    Ok(normalized)
 }
 
 /// A `daily-folder` value must name a place inside the notebook, so it has
@@ -777,5 +990,162 @@ mod tests {
         let file = base.path().join("a").join("b").join("config.toml");
         ensure_dir(&file).expect("ensure_dir succeeds");
         assert!(base.path().join("a").join("b").is_dir());
+    }
+
+    #[test]
+    fn load_reads_the_stamp_keys() {
+        let base = temp();
+        let file = base.path().join("config.toml");
+        fs::write(
+            &file,
+            "stamp = false\nstamp-created-key = 'made'\nstamp-updated-key = 'touched'\n\
+             stamp-format = '%Y'\nstamp-exclude = ['templates', 'archive/2026']\n",
+        )
+        .expect("fixture writes");
+        let config = load(&file).expect("config loads");
+        assert_eq!(config.stamp, Some(false));
+        assert_eq!(config.stamp_created_key, Some("made".to_owned()));
+        assert_eq!(config.stamp_updated_key, Some("touched".to_owned()));
+        assert_eq!(
+            config.stamp_format,
+            Some(day::StampFormat::new("%Y").expect("format validates"))
+        );
+        assert_eq!(
+            config.stamp_exclude,
+            Some(vec![
+                PathBuf::from("templates"),
+                PathBuf::from("archive/2026")
+            ])
+        );
+    }
+
+    #[test]
+    fn load_rejects_stamp_values_of_the_wrong_shape() {
+        let cases = [
+            ("stamp = 'yes'\n", "`stamp` must be true or false"),
+            ("stamp-created-key = 1\n", "must be a string"),
+            ("stamp-updated-key = 1\n", "must be a string"),
+            (
+                "stamp-created-key = 'a:b'\n",
+                "`stamp-created-key`: invalid property key",
+            ),
+            (
+                "stamp-updated-key = 'a#b'\n",
+                "`stamp-updated-key`: invalid property key",
+            ),
+            ("stamp-format = 1\n", "must be a string"),
+            ("stamp-format = '%Q'\n", "`stamp-format`: timestamp format"),
+            ("stamp-exclude = 'x'\n", "must be an array of strings"),
+            ("stamp-exclude = [1]\n", "must be an array of strings"),
+            (
+                "stamp-exclude = ['/abs']\n",
+                "entries must be relative paths",
+            ),
+            ("stamp-exclude = ['']\n", "entries must not be empty"),
+            (
+                "stamp-exclude = ['..']\n",
+                "must name a place inside the notebook",
+            ),
+            (
+                "stamp-exclude = ['a/../b']\n",
+                "must name a place inside the notebook",
+            ),
+            (
+                "stamp-exclude = ['.']\n",
+                "must name a place inside the notebook",
+            ),
+        ];
+        let base = temp();
+        let file = base.path().join("config.toml");
+        for (contents, fragment) in cases {
+            fs::write(&file, contents).expect("fixture writes");
+            let error = load(&file).expect_err("bad value fails");
+            assert!(error.to_string().contains(fragment), "for {contents:?}");
+        }
+    }
+
+    #[test]
+    fn set_stamp_round_trips_and_rejects_other_words() {
+        let base = temp();
+        let file = base.path().join("config.toml");
+        set_stamp(&file, "false").expect("set succeeds");
+        assert_eq!(load(&file).expect("config loads").stamp, Some(false));
+        set_stamp(&file, "true").expect("set succeeds");
+        assert_eq!(load(&file).expect("config loads").stamp, Some(true));
+        let fresh = temp();
+        let missing = fresh.path().join("config.toml");
+        let error = set_stamp(&missing, "maybe").expect_err("bad value fails");
+        assert!(error.to_string().contains("must be true or false"));
+        assert!(!missing.exists());
+    }
+
+    #[test]
+    fn set_stamp_keys_round_trip_and_validate() {
+        let base = temp();
+        let file = base.path().join("config.toml");
+        set_stamp_created_key(&file, "made").expect("set succeeds");
+        set_stamp_updated_key(&file, "touched").expect("set succeeds");
+        let config = load(&file).expect("config loads");
+        assert_eq!(config.stamp_created_key, Some("made".to_owned()));
+        assert_eq!(config.stamp_updated_key, Some("touched".to_owned()));
+        let fresh = temp();
+        let missing = fresh.path().join("config.toml");
+        set_stamp_created_key(&missing, "a:b").expect_err("bad key fails");
+        set_stamp_updated_key(&missing, "-a").expect_err("bad key fails");
+        assert!(!missing.exists());
+    }
+
+    #[test]
+    fn set_stamp_format_round_trips_and_validates() {
+        let base = temp();
+        let file = base.path().join("config.toml");
+        set_stamp_format(&file, "%Y-%m-%d %H:%M").expect("set succeeds");
+        assert_eq!(
+            load(&file).expect("config loads").stamp_format,
+            Some(day::StampFormat::new("%Y-%m-%d %H:%M").expect("format validates"))
+        );
+        let fresh = temp();
+        let missing = fresh.path().join("config.toml");
+        set_stamp_format(&missing, "%Q").expect_err("bad format fails");
+        assert!(!missing.exists());
+    }
+
+    #[test]
+    fn set_stamp_exclude_splits_on_commas_and_trims() {
+        let base = temp();
+        let file = base.path().join("config.toml");
+        set_stamp_exclude(&file, " templates , archive/2026 ").expect("set succeeds");
+        assert_eq!(
+            load(&file).expect("config loads").stamp_exclude,
+            Some(vec![
+                PathBuf::from("templates"),
+                PathBuf::from("archive/2026")
+            ])
+        );
+    }
+
+    /// A `./` spelling loads as the place it names, so exclusion
+    /// matching, which compares components, sees it.
+    #[test]
+    fn stamp_exclude_normalizes_curdir_components() {
+        let base = temp();
+        let file = base.path().join("config.toml");
+        fs::write(&file, "stamp-exclude = ['./templates']\n").expect("fixture writes");
+        assert_eq!(
+            load(&file).expect("config loads").stamp_exclude,
+            Some(vec![PathBuf::from("templates")])
+        );
+    }
+
+    #[test]
+    fn set_stamp_exclude_validates_every_entry() {
+        let base = temp();
+        let file = base.path().join("config.toml");
+        set_stamp_exclude(&file, "").expect_err("empty entry fails");
+        set_stamp_exclude(&file, "a,,b").expect_err("empty entry fails");
+        set_stamp_exclude(&file, "/abs").expect_err("rooted entry fails");
+        set_stamp_exclude(&file, "..").expect_err("escaping entry fails");
+        set_stamp_exclude(&file, ".").expect_err("escaping entry fails");
+        assert!(!file.exists());
     }
 }

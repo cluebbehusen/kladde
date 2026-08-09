@@ -97,18 +97,21 @@ impl NotePath {
     }
 
     /// The canonical root of the notebook the note was resolved in.
-    pub(crate) fn root(&self) -> &Path {
+    #[must_use]
+    pub fn root(&self) -> &Path {
         &self.root
     }
 
-    /// The note's path relative to its notebook root.
+    /// The note's path relative to its notebook root, which is what
+    /// notebook-relative settings like `stamp-exclude` match against.
     ///
     /// # Panics
     ///
     /// Panics when the path does not start with the root, which
     /// construction rules out: a note always lies inside its notebook's
     /// root.
-    pub(crate) fn relative(&self) -> &Path {
+    #[must_use]
+    pub fn relative(&self) -> &Path {
         self.absolute
             .strip_prefix(&self.root)
             .expect("a note lies inside its notebook")

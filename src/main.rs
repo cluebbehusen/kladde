@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use unicase::UniCase;
 
 /// CLI for a local markdown notebook.
 ///
@@ -38,13 +39,100 @@ enum Command {
     /// whatever you type. The note is created if it does not exist, parent
     /// folders included, except that a note targeted by name must already
     /// exist. With no target, the note is today's daily note. Writes take
-    /// a per-note lock and replace the note atomically, so concurrent
+    /// the notebook's lock and replace the note atomically, so concurrent
     /// appends never lose an entry.
     Append {
         /// Text to append, verbatim. Text spelled exactly like an option
         /// of this command needs a `--` separator first.
         #[arg(allow_hyphen_values = true)]
         text: String,
+        #[command(flatten)]
+        target: TargetArgs,
+        #[command(flatten)]
+        notebook: NotebookArg,
+    },
+    /// Work with a note's properties.
+    ///
+    /// Properties are the note's YAML frontmatter: `key: value` lines
+    /// between `---` fences at the very start of the note. A value is
+    /// text or a list of texts. Edits rewrite only the named property
+    /// and take the notebook's lock, like every kladde write.
+    #[command(subcommand)]
+    Frontmatter(FrontmatterCommand),
+}
+
+#[derive(Subcommand)]
+enum FrontmatterCommand {
+    /// Print a property's value.
+    ///
+    /// A text value prints on one line, a list value one item per line.
+    /// Exits with status 1 and no output when the note or the property
+    /// does not exist. With no target, the note is today's daily note.
+    Get {
+        /// Property to read.
+        key: String,
+        #[command(flatten)]
+        target: TargetArgs,
+        #[command(flatten)]
+        notebook: NotebookArg,
+    },
+    /// Set a property to a text value.
+    ///
+    /// Replaces the property's value whatever shape it held, and creates
+    /// the note, its frontmatter block, and the property as needed.
+    Set {
+        /// Property to change.
+        key: String,
+        /// New value. A value spelled exactly like an option of this
+        /// command needs a `--` separator first.
+        #[arg(allow_hyphen_values = true)]
+        value: String,
+        #[command(flatten)]
+        target: TargetArgs,
+        #[command(flatten)]
+        notebook: NotebookArg,
+    },
+    /// Remove a property.
+    ///
+    /// Removing the last property removes the frontmatter block too. A
+    /// property that does not exist is already removed, which is
+    /// success.
+    Unset {
+        /// Property to remove.
+        key: String,
+        #[command(flatten)]
+        target: TargetArgs,
+        #[command(flatten)]
+        notebook: NotebookArg,
+    },
+    /// Add an item to a list property.
+    ///
+    /// Creates the note, its frontmatter block, and the property as
+    /// needed. An item already in the list is already added, which is
+    /// success.
+    Add {
+        /// List property to extend.
+        key: String,
+        /// Item to add. An item spelled exactly like an option of this
+        /// command needs a `--` separator first.
+        #[arg(allow_hyphen_values = true)]
+        item: String,
+        #[command(flatten)]
+        target: TargetArgs,
+        #[command(flatten)]
+        notebook: NotebookArg,
+    },
+    /// Remove an item from a list property.
+    ///
+    /// An item or property that does not exist is already removed, which
+    /// is success; removing the last item leaves an empty list.
+    Remove {
+        /// List property to shorten.
+        key: String,
+        /// Item to remove. An item spelled exactly like an option of
+        /// this command needs a `--` separator first.
+        #[arg(allow_hyphen_values = true)]
+        item: String,
         #[command(flatten)]
         target: TargetArgs,
         #[command(flatten)]
@@ -115,6 +203,16 @@ enum ConfigKey {
     DailyFolder,
     /// Date format for daily note file names, for example `%Y-%m-%d`.
     DailyDateFormat,
+    /// Whether writes stamp created/updated properties: true or false.
+    Stamp,
+    /// Property name for the created stamp.
+    StampCreatedKey,
+    /// Property name for the updated stamp.
+    StampUpdatedKey,
+    /// Timestamp format for stamp values, for example `%Y-%m-%dT%H:%M:%S`.
+    StampFormat,
+    /// Comma-separated notebook-relative paths that are never stamped.
+    StampExclude,
 }
 
 impl ConfigKey {
@@ -124,6 +222,11 @@ impl ConfigKey {
             Self::Editor => kladde::config::EDITOR,
             Self::DailyFolder => kladde::config::DAILY_FOLDER,
             Self::DailyDateFormat => kladde::config::DAILY_DATE_FORMAT,
+            Self::Stamp => kladde::config::STAMP,
+            Self::StampCreatedKey => kladde::config::STAMP_CREATED_KEY,
+            Self::StampUpdatedKey => kladde::config::STAMP_UPDATED_KEY,
+            Self::StampFormat => kladde::config::STAMP_FORMAT,
+            Self::StampExclude => kladde::config::STAMP_EXCLUDE,
         }
     }
 }
@@ -143,6 +246,7 @@ fn main() -> ExitCode {
             target,
             notebook,
         } => append(&text, target, notebook.notebook),
+        Command::Frontmatter(command) => frontmatter(command),
     }
 }
 
@@ -166,22 +270,248 @@ fn dispatch(
     daily_note(target.date, flag, act)
 }
 
-fn append(text: &str, target: TargetArgs, flag: Option<PathBuf>) -> ExitCode {
-    let locks = kladde::write::lock_dir(
+/// The directory for lock files, from the environment.
+fn locks() -> Result<PathBuf, &'static str> {
+    kladde::write::lock_dir(
         env::var_os("XDG_STATE_HOME").map(PathBuf::from),
         env::var_os("HOME").map(PathBuf::from),
-    );
-    let Some(locks) = locks else {
-        return fail(NO_STATE_DIR);
+    )
+    .ok_or(NO_STATE_DIR)
+}
+
+fn append(text: &str, target: TargetArgs, flag: Option<PathBuf>) -> ExitCode {
+    let locks = match locks() {
+        Ok(locks) => locks,
+        Err(message) => return fail(message),
     };
+    let config = match loaded_config(flag.is_some()) {
+        Ok(config) => config,
+        Err(message) => return fail(message),
+    };
+    let stamping = stamping(config);
     dispatch(target, flag, |note| {
-        match kladde::write::append(&locks, note, text) {
+        let guard = match kladde::write::Guard::acquire(&locks, note) {
+            Ok(guard) => guard,
+            Err(error) => return fail(error),
+        };
+        let timestamp = stamping.timestamp(note);
+        match guard.append(text, stamping.stamp(timestamp.as_deref()).as_ref()) {
             Ok(()) => {
                 print_path(note.as_path());
                 ExitCode::SUCCESS
             }
             Err(error) => fail(error),
         }
+    })
+}
+
+/// The stamping inputs a write resolves once: whether stamping is on, the
+/// stamp key names, the timestamp format, and the excluded paths.
+struct Stamping {
+    enabled: bool,
+    created_key: String,
+    updated_key: String,
+    format: kladde::day::StampFormat,
+    excludes: Vec<PathBuf>,
+}
+
+/// Resolves stamping from the config; the clock is read later, per
+/// write, because the library stays clock-free.
+fn stamping(config: kladde::config::Config) -> Stamping {
+    Stamping {
+        enabled: config.stamp.unwrap_or(true),
+        created_key: config
+            .stamp_created_key
+            .unwrap_or_else(|| kladde::frontmatter::DEFAULT_CREATED_KEY.to_owned()),
+        updated_key: config
+            .stamp_updated_key
+            .unwrap_or_else(|| kladde::frontmatter::DEFAULT_UPDATED_KEY.to_owned()),
+        format: config.stamp_format.unwrap_or_default(),
+        excludes: config.stamp_exclude.unwrap_or_default(),
+    }
+}
+
+impl Stamping {
+    /// The timestamp to stamp `note` with, rendered from the clock now:
+    /// callers ask while already holding the notebook's lock, so stamps
+    /// record the serialized write order and updated never runs
+    /// backwards. `None` when stamping is off or the note sits under an
+    /// excluded path.
+    fn timestamp(&self, note: &Note) -> Option<String> {
+        let excluded = self.excludes.iter().any(|entry| excluded(note, entry));
+        (self.enabled && !excluded).then(|| self.format.render(jiff::Zoned::now().datetime()))
+    }
+
+    /// The stamp carrying `timestamp`, or `None` when there is none.
+    fn stamp<'a>(&'a self, timestamp: Option<&'a str>) -> Option<kladde::frontmatter::Stamp<'a>> {
+        timestamp.map(|timestamp| {
+            kladde::frontmatter::Stamp::new(&self.created_key, &self.updated_key, timestamp)
+                .expect("stamp settings are validated by config")
+        })
+    }
+}
+
+/// Whether `note` sits under the excluded `entry`, matched the way notes
+/// are identified: by spelling with case folded, and by what the entry
+/// resolves to inside the notebook. Folding uses the same equivalence as
+/// name lookup, so an entry matches a case-aliased spelling even before
+/// its folder first exists; on a filesystem that does not fold, an entry
+/// can at worst over-match, and the cost is a note left unstamped.
+/// Resolution covers linked and normalized spellings once the folder
+/// exists. Unicode-normalization aliases before the folder exists are
+/// the accepted gap, shared with name lookup: closing it would take
+/// normalization tables for an alias only a foreign toolchain can
+/// produce, and the first write heals on the next.
+fn excluded(note: &Note, entry: &Path) -> bool {
+    if folded_starts_with(note.relative(), entry) {
+        return true;
+    }
+    resolved_exclude(note.root(), entry)
+        .is_some_and(|resolved| folded_starts_with(note.relative(), &resolved))
+}
+
+/// The entry's place inside the notebook once links and filesystem
+/// spellings resolve: the deepest existing ancestor is canonicalized the
+/// way note paths are, and the not-yet-created remainder rides along as
+/// spelled. `None` when nothing of the entry exists yet, or when it
+/// resolves outside the notebook.
+fn resolved_exclude(root: &Path, entry: &Path) -> Option<PathBuf> {
+    let components: Vec<_> = entry.components().collect();
+    for split in (1..=components.len()).rev() {
+        let prefix: PathBuf = components[..split].iter().collect();
+        let Ok(target) = std::fs::canonicalize(root.join(&prefix)) else {
+            continue;
+        };
+        let suffix: PathBuf = components[split..].iter().collect();
+        return Some(target.strip_prefix(root).ok()?.join(suffix));
+    }
+    None
+}
+
+/// Component-wise prefix match with case folded.
+fn folded_starts_with(path: &Path, prefix: &Path) -> bool {
+    let mut components = path.components();
+    prefix.components().all(|wanted| {
+        components.next().is_some_and(|component| {
+            UniCase::new(component.as_os_str().to_string_lossy())
+                == UniCase::new(wanted.as_os_str().to_string_lossy())
+        })
+    })
+}
+
+fn frontmatter(command: FrontmatterCommand) -> ExitCode {
+    match command {
+        FrontmatterCommand::Get {
+            key,
+            target,
+            notebook,
+        } => frontmatter_get(&key, target, notebook.notebook),
+        FrontmatterCommand::Set {
+            key,
+            value,
+            target,
+            notebook,
+        } => frontmatter_edit(target, notebook.notebook, |current| {
+            kladde::frontmatter::set(current, &key, &value)
+        }),
+        FrontmatterCommand::Unset {
+            key,
+            target,
+            notebook,
+        } => frontmatter_edit(target, notebook.notebook, |current| {
+            kladde::frontmatter::unset(current, &key)
+        }),
+        FrontmatterCommand::Add {
+            key,
+            item,
+            target,
+            notebook,
+        } => frontmatter_edit(target, notebook.notebook, |current| {
+            kladde::frontmatter::add(current, &key, &item)
+        }),
+        FrontmatterCommand::Remove {
+            key,
+            item,
+            target,
+            notebook,
+        } => frontmatter_edit(target, notebook.notebook, |current| {
+            kladde::frontmatter::remove(current, &key, &item)
+        }),
+    }
+}
+
+/// Prints a property's value without taking the notebook's lock: the
+/// atomic replace means a reader never sees a half-written note, and a
+/// read must not create or wait for anything.
+fn frontmatter_get(key: &str, target: TargetArgs, flag: Option<PathBuf>) -> ExitCode {
+    dispatch(target, flag, |note| {
+        let path = note.as_path();
+        let contents = match std::fs::read_to_string(path) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(error) => return fail(format!("cannot read {}: {error}", path.display())),
+        };
+        match kladde::frontmatter::get(&contents, key) {
+            Ok(Some(kladde::frontmatter::Value::Scalar(value))) => {
+                println!("{value}");
+                ExitCode::SUCCESS
+            }
+            Ok(Some(kladde::frontmatter::Value::List(items))) => {
+                for item in items {
+                    println!("{item}");
+                }
+                ExitCode::SUCCESS
+            }
+            Ok(None) => ExitCode::FAILURE,
+            Err(error) => fail(error),
+        }
+    })
+}
+
+/// Runs a frontmatter edit under the notebook's lock: read, transform,
+/// stamp, atomically replace. An edit that changes nothing skips the
+/// write and the stamp, so an idempotent edit cannot create a note or
+/// bump its updated stamp.
+fn frontmatter_edit(
+    target: TargetArgs,
+    flag: Option<PathBuf>,
+    edit: impl FnOnce(&str) -> Result<String, kladde::frontmatter::Error>,
+) -> ExitCode {
+    let locks = match locks() {
+        Ok(locks) => locks,
+        Err(message) => return fail(message),
+    };
+    let config = match loaded_config(flag.is_some()) {
+        Ok(config) => config,
+        Err(message) => return fail(message),
+    };
+    let stamping = stamping(config);
+    dispatch(target, flag, |note| {
+        let guard = match kladde::write::Guard::acquire(&locks, note) {
+            Ok(guard) => guard,
+            Err(error) => return fail(error),
+        };
+        let current = match guard.current() {
+            Ok(current) => current,
+            Err(error) => return fail(error),
+        };
+        let new = match edit(&current) {
+            Ok(new) => new,
+            Err(error) => return fail(error),
+        };
+        if new != current {
+            let had_block = kladde::frontmatter::has_block(&current);
+            let timestamp = stamping.timestamp(note);
+            let stamped = match stamping.stamp(timestamp.as_deref()) {
+                Some(stamp) => kladde::frontmatter::stamped(&new, had_block, &stamp),
+                None => new,
+            };
+            if let Err(error) = guard.replace(&stamped) {
+                return fail(error);
+            }
+        }
+        print_path(note.as_path());
+        ExitCode::SUCCESS
     })
 }
 
@@ -216,7 +546,7 @@ fn daily_note(
     flag: Option<PathBuf>,
     act: impl FnOnce(&Note) -> ExitCode,
 ) -> ExitCode {
-    let config = match daily_config(flag.is_some()) {
+    let config = match loaded_config(flag.is_some()) {
         Ok(config) => config,
         Err(message) => return fail(message),
     };
@@ -239,11 +569,14 @@ fn daily_note(
     )
 }
 
-/// The config a daily note draws its keys from. A missing file is an empty
-/// config; an unlocatable config directory is one too when `--notebook`
-/// pins the notebook, and an error otherwise, since the default notebook
-/// could only come from config.
-fn daily_config(explicit_notebook: bool) -> Result<kladde::config::Config, String> {
+/// The config a command draws optional keys from: the daily note keys and
+/// the stamp keys have no flag override, so even an explicit `--notebook`
+/// reads the file, and a broken config fails the command rather than
+/// silently dropping those keys. A missing file is an empty config; an
+/// unlocatable config directory is one too when `--notebook` pins the
+/// notebook, and an error otherwise, since the default notebook could
+/// only come from config.
+fn loaded_config(explicit_notebook: bool) -> Result<kladde::config::Config, String> {
     let file = kladde::config::file(
         env::var_os("XDG_CONFIG_HOME").map(PathBuf::from),
         env::var_os("HOME").map(PathBuf::from),
@@ -331,6 +664,51 @@ fn get(file: &Path, key: ConfigKey) -> ExitCode {
                 ExitCode::FAILURE
             }
         }
+        ConfigKey::Stamp => {
+            if let Some(stamp) = config.stamp {
+                println!("{stamp}");
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
+        }
+        ConfigKey::StampCreatedKey => {
+            if let Some(key) = config.stamp_created_key {
+                println!("{key}");
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
+        }
+        ConfigKey::StampUpdatedKey => {
+            if let Some(key) = config.stamp_updated_key {
+                println!("{key}");
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
+        }
+        ConfigKey::StampFormat => {
+            if let Some(format) = config.stamp_format {
+                println!("{}", format.as_str());
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
+        }
+        ConfigKey::StampExclude => {
+            if let Some(entries) = config.stamp_exclude {
+                let joined = entries
+                    .iter()
+                    .map(|entry| entry.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(",");
+                println!("{joined}");
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
+        }
     }
 }
 
@@ -343,6 +721,11 @@ fn set(file: &Path, key: ConfigKey, value: &str) -> ExitCode {
         ConfigKey::Editor => finish(kladde::config::set_editor(file, value)),
         ConfigKey::DailyFolder => finish(kladde::config::set_daily_folder(file, value)),
         ConfigKey::DailyDateFormat => finish(kladde::config::set_daily_date_format(file, value)),
+        ConfigKey::Stamp => finish(kladde::config::set_stamp(file, value)),
+        ConfigKey::StampCreatedKey => finish(kladde::config::set_stamp_created_key(file, value)),
+        ConfigKey::StampUpdatedKey => finish(kladde::config::set_stamp_updated_key(file, value)),
+        ConfigKey::StampFormat => finish(kladde::config::set_stamp_format(file, value)),
+        ConfigKey::StampExclude => finish(kladde::config::set_stamp_exclude(file, value)),
     }
 }
 

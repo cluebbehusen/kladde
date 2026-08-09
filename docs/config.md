@@ -24,6 +24,21 @@ daily-folder = "Daily Notes"
 
 # strftime format for daily note file names. Unset means "%Y-%m-%d".
 daily-date-format = "%Y-%m-%d"
+
+# Whether writes stamp created/updated properties. Unset means true.
+stamp = true
+
+# Property name for the created stamp. Unset means "created".
+stamp-created-key = "created"
+
+# Property name for the updated stamp. Unset means "updated".
+stamp-updated-key = "updated"
+
+# strftime format for stamp values. Unset means "%Y-%m-%dT%H:%M:%S".
+stamp-format = "%Y-%m-%dT%H:%M:%S"
+
+# Notebook-relative paths whose notes are never stamped. Unset means none.
+stamp-exclude = ["templates"]
 ```
 
 Unknown keys are errors, so a typo fails loudly instead of silently doing
@@ -53,6 +68,36 @@ notes live at the notebook root.
 strftime format for daily note file names; `.md` is appended. Unset means
 `%Y-%m-%d`, so a note for August 4th, 2026 is `2026-08-04.md`. The format may
 contain `/` to spread daily notes across nested folders, for example `%Y/%m/%d`.
+
+### `stamp`
+
+Whether kladde stamps the notes it writes: a created property added when kladde
+creates a note's frontmatter block, and an updated property refreshed on every
+write that changes the note. Unset means `true`; set it to `false` to turn
+stamping off on this machine.
+
+### `stamp-created-key`
+
+Property name for the created stamp. Unset means `created`.
+
+### `stamp-updated-key`
+
+Property name for the updated stamp. Unset means `updated`.
+
+### `stamp-format`
+
+strftime format for stamp values, rendered in local time. Unset means
+`%Y-%m-%dT%H:%M:%S`, a shape markdown editors read as a date and time. Any other
+format still stamps; an editor may then treat the values as plain text.
+
+### `stamp-exclude`
+
+Notebook-relative paths whose notes are never stamped, meant for template
+folders and other notes that must stay bare. A note is excluded when its path
+inside the notebook starts with an entry. `config set` takes the entries
+comma-separated, so `kladde config set stamp-exclude "templates,archive"`
+excludes two folders; an entry containing a comma can only be written by editing
+the file directly.
 
 ## Commands
 
