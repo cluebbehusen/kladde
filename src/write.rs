@@ -239,17 +239,6 @@ impl<'a> Guard<'a> {
         Ok(())
     }
 
-    /// Reads the note, applies `transform` to its contents, and replaces
-    /// the note with the result: [`Self::current`] composed with
-    /// [`Self::replace`].
-    ///
-    /// # Errors
-    ///
-    /// Returns the errors of [`Self::current`] and [`Self::replace`].
-    pub fn update(&self, transform: impl FnOnce(&str) -> String) -> Result<(), Error> {
-        self.replace(&transform(&self.current()?))
-    }
-
     /// Appends `text` to the end of the note as its own line, creating
     /// the note (parent folders included) if it does not exist. The text
     /// is appended verbatim, so a bullet is whatever the caller types;
@@ -679,7 +668,7 @@ mod tests {
     /// The containment proof is point-in-time: a folder swapped for an
     /// escaping link after resolution is caught again under the lock.
     #[test]
-    fn update_rejects_a_folder_that_left_the_notebook() {
+    fn append_rejects_a_folder_that_left_the_notebook() {
         let root = temp();
         let locks = temp();
         let outside = temp();
@@ -734,15 +723,16 @@ mod tests {
     }
 
     #[test]
-    fn update_runs_a_transform_under_the_lock() {
+    fn current_and_replace_compose_under_the_lock() {
         let root = temp();
         let locks = temp();
         fs::write(root.path().join("x.md"), "before").expect("fixture writes");
         let target = note(&root, "x.md");
         let guard = Guard::acquire(locks.path(), &target).expect("lock acquires");
+        let current = guard.current().expect("read succeeds");
         guard
-            .update(|current| format!("{current} after"))
-            .expect("update succeeds");
+            .replace(&format!("{current} after"))
+            .expect("replace succeeds");
         let contents = fs::read_to_string(target.as_path()).expect("note reads");
         assert_eq!(contents, "before after");
     }
