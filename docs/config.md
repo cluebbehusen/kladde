@@ -39,6 +39,9 @@ stamp-format = "%Y-%m-%dT%H:%M:%S"
 
 # Notebook-relative paths whose notes are never stamped. Unset means none.
 stamp-exclude = ["templates"]
+
+# Indent unit for entries nested under a childless bullet. Unset means "tab".
+bullet-indent = "tab"
 ```
 
 Unknown keys are errors, so a typo fails loudly instead of silently doing
@@ -98,6 +101,15 @@ inside the notebook starts with an entry. `config set` takes the entries
 comma-separated, so `kladde config set stamp-exclude "templates,archive"`
 excludes two folders; an entry containing a comma can only be written by editing
 the file directly.
+
+### `bullet-indent`
+
+Indent unit used when `kladde append --under-bullet` nests an entry under a
+bullet that has no child bullet yet. Both units indent to the column where the
+bullet's own text starts, the indent CommonMark asks of a nested item: `tab`
+gets there with tabs, `spaces` with spaces. A bullet that already has a child is
+not affected by this key: kladde copies that child's indent, so a note keeps its
+own style. Unset means `tab`.
 
 ## Commands
 

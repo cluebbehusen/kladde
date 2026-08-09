@@ -33,19 +33,35 @@ enum Command {
         #[command(flatten)]
         notebook: NotebookArg,
     },
-    /// Append text to the end of a note.
+    /// Append text to a note.
     ///
     /// The text is appended verbatim as its own line, so a bullet is
-    /// whatever you type. The note is created if it does not exist, parent
-    /// folders included, except that a note targeted by name must already
-    /// exist. With no target, the note is today's daily note. Writes take
-    /// the notebook's lock and replace the note atomically, so concurrent
+    /// whatever you type. It lands at the end of the note, or inside it
+    /// with `--under` and `--under-bullet`: at the end of a heading's
+    /// section, or nested at the end of a bullet's thread. The note is
+    /// created if it does not exist, parent folders included, except
+    /// that a note targeted by name must already exist, and a placed
+    /// append fails rather than create a note its target cannot match.
+    /// With no target, the note is today's daily note. Writes take the
+    /// notebook's lock and replace the note atomically, so concurrent
     /// appends never lose an entry.
     Append {
         /// Text to append, verbatim. Text spelled exactly like an option
         /// of this command needs a `--` separator first.
         #[arg(allow_hyphen_values = true)]
         text: String,
+        /// Heading whose section receives the text, a prefix of the
+        /// heading as written, its `#` marks excluded. Exactly one
+        /// heading must match. Repeat to descend: each later heading is
+        /// found inside the previous one's section.
+        #[arg(long, value_name = "HEADING", allow_hyphen_values = true)]
+        under: Vec<String>,
+        /// Bullet the text is nested under, a prefix of the bullet's
+        /// first line past its marker. Exactly one bullet must match.
+        /// Repeat to descend a thread; with `--under`, the first bullet
+        /// is found inside that section.
+        #[arg(long, value_name = "BULLET", allow_hyphen_values = true)]
+        under_bullet: Vec<String>,
         #[command(flatten)]
         target: TargetArgs,
         #[command(flatten)]
@@ -213,6 +229,9 @@ enum ConfigKey {
     StampFormat,
     /// Comma-separated notebook-relative paths that are never stamped.
     StampExclude,
+    /// Indent unit for entries nested under a childless bullet: tab or
+    /// spaces.
+    BulletIndent,
 }
 
 impl ConfigKey {
@@ -227,6 +246,7 @@ impl ConfigKey {
             Self::StampUpdatedKey => kladde::config::STAMP_UPDATED_KEY,
             Self::StampFormat => kladde::config::STAMP_FORMAT,
             Self::StampExclude => kladde::config::STAMP_EXCLUDE,
+            Self::BulletIndent => kladde::config::BULLET_INDENT,
         }
     }
 }
@@ -245,9 +265,11 @@ fn main() -> ExitCode {
         }
         Command::Append {
             text,
+            under,
+            under_bullet,
             target,
             notebook,
-        } => append(&text, target, notebook.notebook),
+        } => append(&text, under, under_bullet, target, notebook.notebook),
         Command::Frontmatter(command) => frontmatter(command),
     }
 }
@@ -286,7 +308,13 @@ fn locks() -> Result<PathBuf, &'static str> {
     .ok_or(NO_STATE_DIR)
 }
 
-fn append(text: &str, target: TargetArgs, flag: Option<PathBuf>) -> ExitCode {
+fn append(
+    text: &str,
+    under: Vec<String>,
+    under_bullet: Vec<String>,
+    target: TargetArgs,
+    flag: Option<PathBuf>,
+) -> ExitCode {
     let locks = match locks() {
         Ok(locks) => locks,
         Err(message) => return fail(message),
@@ -295,11 +323,20 @@ fn append(text: &str, target: TargetArgs, flag: Option<PathBuf>) -> ExitCode {
         Ok(config) => config,
         Err(message) => return fail(message),
     };
+    let placement = kladde::structure::Placement {
+        headings: under,
+        bullets: under_bullet,
+        indent: config.bullet_indent.unwrap_or_default(),
+    };
     let stamping = stamping(config);
     dispatch(target, flag, Some(&locks), |note, guard| {
         let guard = guard.expect("write dispatch locks the notebook");
         let timestamp = stamping.timestamp(note);
-        match guard.append(text, stamping.stamp(timestamp.as_deref()).as_ref()) {
+        match guard.append(
+            text,
+            &placement,
+            stamping.stamp(timestamp.as_deref()).as_ref(),
+        ) {
             Ok(()) => {
                 print_path(note.as_path());
                 ExitCode::SUCCESS
@@ -738,6 +775,14 @@ fn get(file: &Path, key: ConfigKey) -> ExitCode {
                 ExitCode::FAILURE
             }
         }
+        ConfigKey::BulletIndent => {
+            if let Some(indent) = config.bullet_indent {
+                println!("{}", indent.as_str());
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            }
+        }
     }
 }
 
@@ -755,6 +800,7 @@ fn set(file: &Path, key: ConfigKey, value: &str) -> ExitCode {
         ConfigKey::StampUpdatedKey => finish(kladde::config::set_stamp_updated_key(file, value)),
         ConfigKey::StampFormat => finish(kladde::config::set_stamp_format(file, value)),
         ConfigKey::StampExclude => finish(kladde::config::set_stamp_exclude(file, value)),
+        ConfigKey::BulletIndent => finish(kladde::config::set_bullet_indent(file, value)),
     }
 }
 

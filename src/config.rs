@@ -7,6 +7,7 @@ use std::path::{Component, Path, PathBuf};
 use toml_edit::DocumentMut;
 
 use crate::day;
+use crate::structure;
 
 /// Config key naming the notebook used when a command is not given an
 /// explicit notebook.
@@ -40,6 +41,10 @@ pub const STAMP_FORMAT: &str = "stamp-format";
 /// stamped.
 pub const STAMP_EXCLUDE: &str = "stamp-exclude";
 
+/// Config key choosing the indent unit for entries nested under a
+/// childless bullet.
+pub const BULLET_INDENT: &str = "bullet-indent";
+
 /// Settings read from the config file.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Config {
@@ -65,6 +70,9 @@ pub struct Config {
     /// Notebook-relative paths whose notes are never stamped; unset means
     /// none.
     pub stamp_exclude: Option<Vec<PathBuf>>,
+    /// Indent unit for entries nested under a childless bullet; unset
+    /// means [`structure::Indent::Tab`].
+    pub bullet_indent: Option<structure::Indent>,
 }
 
 /// Failure while reading, validating, or writing the config file.
@@ -111,6 +119,8 @@ pub enum Error {
     EmptyExclude,
     #[error("`stamp-exclude` entries must name a place inside the notebook, got \"{value}\"")]
     EscapingExclude { value: String },
+    #[error("`bullet-indent` must be \"tab\" or \"spaces\"")]
+    InvalidBulletIndent,
     #[error("not a directory: {}", path.display())]
     NotADirectory { path: PathBuf },
     #[error("cannot create {}: {cause}", path.display())]
@@ -232,6 +242,12 @@ pub fn load(file: &Path) -> Result<Config, Error> {
                     entries.push(validated_exclude(value)?);
                 }
                 config.stamp_exclude = Some(entries);
+            }
+            BULLET_INDENT => {
+                let value = item
+                    .as_str()
+                    .ok_or(Error::NotAString { key: BULLET_INDENT })?;
+                config.bullet_indent = Some(validated_bullet_indent(value)?);
             }
             unknown => {
                 return Err(Error::UnknownKey {
@@ -405,6 +421,30 @@ pub fn set_stamp_exclude(file: &Path, value: &str) -> Result<(), Error> {
     let mut document = read_document(file)?;
     document[STAMP_EXCLUDE] = toml_edit::value(array);
     save(file, &document)
+}
+
+/// Stores `value` under the `bullet-indent` key, creating the config file
+/// and its directory if needed and preserving the rest of the file,
+/// comments included.
+///
+/// # Errors
+///
+/// Returns an error when `value` is not `tab` or `spaces`, or when the
+/// config file cannot be read, parsed, or written back.
+pub fn set_bullet_indent(file: &Path, value: &str) -> Result<(), Error> {
+    validated_bullet_indent(value)?;
+    let mut document = read_document(file)?;
+    document[BULLET_INDENT] = toml_edit::value(value);
+    save(file, &document)
+}
+
+/// A `bullet-indent` value names one of the two indent units.
+fn validated_bullet_indent(value: &str) -> Result<structure::Indent, Error> {
+    match value {
+        "tab" => Ok(structure::Indent::Tab),
+        "spaces" => Ok(structure::Indent::Spaces),
+        _ => Err(Error::InvalidBulletIndent),
+    }
 }
 
 /// A stamp key must be writable as a property by the frontmatter module,
@@ -1107,6 +1147,62 @@ mod tests {
         let fresh = temp();
         let missing = fresh.path().join("config.toml");
         set_stamp_format(&missing, "%Q").expect_err("bad format fails");
+        assert!(!missing.exists());
+    }
+
+    #[test]
+    fn load_reads_bullet_indent() {
+        let base = temp();
+        let file = base.path().join("config.toml");
+        let cases = [
+            ("bullet-indent = 'tab'\n", structure::Indent::Tab),
+            ("bullet-indent = 'spaces'\n", structure::Indent::Spaces),
+        ];
+        for (contents, indent) in cases {
+            fs::write(&file, contents).expect("fixture writes");
+            assert_eq!(
+                load(&file).expect("config loads").bullet_indent,
+                Some(indent)
+            );
+        }
+    }
+
+    #[test]
+    fn load_rejects_bullet_indent_values_of_the_wrong_shape() {
+        let cases = [
+            ("bullet-indent = 1\n", "`bullet-indent` must be a string"),
+            (
+                "bullet-indent = 'wide'\n",
+                "`bullet-indent` must be \"tab\" or \"spaces\"",
+            ),
+        ];
+        let base = temp();
+        let file = base.path().join("config.toml");
+        for (contents, fragment) in cases {
+            fs::write(&file, contents).expect("fixture writes");
+            let error = load(&file).expect_err("bad value fails");
+            assert!(error.to_string().contains(fragment), "for {contents:?}");
+        }
+    }
+
+    #[test]
+    fn set_bullet_indent_round_trips_and_validates() {
+        let base = temp();
+        let file = base.path().join("config.toml");
+        set_bullet_indent(&file, "spaces").expect("set succeeds");
+        assert_eq!(
+            load(&file).expect("config loads").bullet_indent,
+            Some(structure::Indent::Spaces)
+        );
+        set_bullet_indent(&file, "tab").expect("set succeeds");
+        assert_eq!(
+            load(&file).expect("config loads").bullet_indent,
+            Some(structure::Indent::Tab)
+        );
+        let fresh = temp();
+        let missing = fresh.path().join("config.toml");
+        let error = set_bullet_indent(&missing, "wide").expect_err("bad value fails");
+        assert!(error.to_string().contains("must be \"tab\" or \"spaces\""));
         assert!(!missing.exists());
     }
 
