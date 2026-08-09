@@ -1957,6 +1957,23 @@ fn frontmatter_never_edits_foreign_blocks() {
         .assert()
         .code(1)
         .stderr(contains("single value, not properties"));
+    fs::write(nb.path().join("m.md"), "---\n- item\nk: v\n---\n").expect("fixture writes");
+    kladde_state(state.path())
+        .args(["frontmatter", "unset", "k", "m.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .code(1)
+        .stderr(contains("single value, not properties"));
+    kladde_state(state.path())
+        .args(["frontmatter", "remove", "k", "a", "m.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .code(1)
+        .stderr(contains("single value, not properties"));
+    assert_eq!(
+        fs::read_to_string(nb.path().join("m.md")).expect("note reads"),
+        "---\n- item\nk: v\n---\n"
+    );
     fs::write(
         nb.path().join("an.md"),
         "---\n&props {foo: bar}\n---\nbody\n",
@@ -2443,6 +2460,42 @@ fn frontmatter_remove_rejects_a_text_property() {
         .assert()
         .code(1)
         .stderr(contains("property \"k\" is not a list"));
+}
+
+#[test]
+fn frontmatter_set_requires_a_notebook() {
+    let state = temp();
+    let xdg = temp();
+    kladde_state(state.path())
+        .env("XDG_CONFIG_HOME", xdg.path())
+        .args(["frontmatter", "set", "k", "v", "x.md"])
+        .assert()
+        .code(1)
+        .stderr(contains("no notebook"));
+}
+
+#[test]
+fn frontmatter_set_reports_an_unopenable_notebook() {
+    let state = temp();
+    let base = temp();
+    kladde_state(state.path())
+        .args(["frontmatter", "set", "k", "v", "x.md", "--notebook"])
+        .arg(base.path().join("missing"))
+        .assert()
+        .code(1)
+        .stderr(contains("cannot open notebook"));
+}
+
+#[test]
+fn frontmatter_set_rejects_an_escaping_target() {
+    let nb = temp();
+    let state = temp();
+    kladde_state(state.path())
+        .args(["frontmatter", "set", "k", "v", "..", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .code(1)
+        .stderr(contains("cannot leave the notebook"));
 }
 
 #[test]
@@ -3218,13 +3271,15 @@ fn writes_report_a_broken_config_despite_a_path_target() {
     assert!(!nb.path().join("x.md").exists());
 }
 
+/// Windows spells the usage line `kladde.exe`, so the assertion anchors
+/// on the subcommand instead of the binary name.
 #[test]
 fn frontmatter_requires_a_subcommand() {
     kladde()
         .arg("frontmatter")
         .assert()
         .code(2)
-        .stderr(contains("Usage: kladde frontmatter"));
+        .stderr(contains("frontmatter <COMMAND>"));
 }
 
 #[test]

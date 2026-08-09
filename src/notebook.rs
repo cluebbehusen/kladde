@@ -119,6 +119,12 @@ impl NotePath {
 }
 
 impl Notebook {
+    /// The notebook's canonical root, the identity its lock is keyed on.
+    #[must_use]
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
     /// Opens the notebook rooted at `root`, canonicalizing it (symlinks,
     /// case, relative paths resolved against the current directory).
     ///
@@ -353,9 +359,9 @@ mod tests {
     #[test]
     fn open_canonicalizes_the_root() {
         let root = temp();
-        let note = notebook(&root)
-            .note(Path::new("x.md"))
-            .expect("target resolves");
+        let opened = notebook(&root);
+        assert_eq!(opened.root(), canonical(&root));
+        let note = opened.note(Path::new("x.md")).expect("target resolves");
         assert_eq!(note.as_path(), canonical(&root).join("x.md"));
     }
 

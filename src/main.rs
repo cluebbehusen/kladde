@@ -237,10 +237,12 @@ const NO_CONFIG_DIR: &str =
 fn main() -> ExitCode {
     match Cli::parse().command {
         Command::Config(command) => config(command),
-        Command::Path { target, notebook } => dispatch(target, notebook.notebook, |note| {
-            print_path(note.as_path());
-            ExitCode::SUCCESS
-        }),
+        Command::Path { target, notebook } => {
+            dispatch(target, notebook.notebook, None, |note, _guard| {
+                print_path(note.as_path());
+                ExitCode::SUCCESS
+            })
+        }
         Command::Append {
             text,
             target,
@@ -255,19 +257,24 @@ const NO_NOTEBOOK: &str = "no notebook: pass --notebook or set the default-noteb
 const NO_STATE_DIR: &str =
     "cannot locate the state directory: neither XDG_STATE_HOME nor HOME is set";
 
-/// Resolves the note a command targets and runs `act` on it.
+/// Resolves the note a command targets and runs `act` on it. With
+/// `locks`, the notebook's lock is taken before the note is resolved and
+/// `act` receives a guard: resolution racing another writer's atomic
+/// replace can transiently misread the filesystem, so writers resolve
+/// inside the critical section.
 fn dispatch(
     target: TargetArgs,
     flag: Option<PathBuf>,
-    act: impl FnOnce(&Note) -> ExitCode,
+    locks: Option<&Path>,
+    act: impl FnOnce(&Note, Option<&kladde::write::Guard>) -> ExitCode,
 ) -> ExitCode {
     if let Some(relative) = target.target {
-        return with_notebook(flag, |notebook| notebook.note(&relative), act);
+        return with_notebook(flag, locks, |notebook| notebook.note(&relative), act);
     }
     if let Some(name) = target.name {
-        return with_notebook(flag, |notebook| notebook.find(&name), act);
+        return with_notebook(flag, locks, |notebook| notebook.find(&name), act);
     }
-    daily_note(target.date, flag, act)
+    daily_note(target.date, flag, locks, act)
 }
 
 /// The directory for lock files, from the environment.
@@ -289,11 +296,8 @@ fn append(text: &str, target: TargetArgs, flag: Option<PathBuf>) -> ExitCode {
         Err(message) => return fail(message),
     };
     let stamping = stamping(config);
-    dispatch(target, flag, |note| {
-        let guard = match kladde::write::Guard::acquire(&locks, note) {
-            Ok(guard) => guard,
-            Err(error) => return fail(error),
-        };
+    dispatch(target, flag, Some(&locks), |note, guard| {
+        let guard = guard.expect("write dispatch locks the notebook");
         let timestamp = stamping.timestamp(note);
         match guard.append(text, stamping.stamp(timestamp.as_deref()).as_ref()) {
             Ok(()) => {
@@ -444,7 +448,7 @@ fn frontmatter(command: FrontmatterCommand) -> ExitCode {
 /// atomic replace means a reader never sees a half-written note, and a
 /// read must not create or wait for anything.
 fn frontmatter_get(key: &str, target: TargetArgs, flag: Option<PathBuf>) -> ExitCode {
-    dispatch(target, flag, |note| {
+    dispatch(target, flag, None, |note, _guard| {
         let path = note.as_path();
         let contents = match std::fs::read_to_string(path) {
             Ok(contents) => contents,
@@ -486,11 +490,8 @@ fn frontmatter_edit(
         Err(message) => return fail(message),
     };
     let stamping = stamping(config);
-    dispatch(target, flag, |note| {
-        let guard = match kladde::write::Guard::acquire(&locks, note) {
-            Ok(guard) => guard,
-            Err(error) => return fail(error),
-        };
+    dispatch(target, flag, Some(&locks), |note, guard| {
+        let guard = guard.expect("write dispatch locks the notebook");
         let current = match guard.current() {
             Ok(current) => current,
             Err(error) => return fail(error),
@@ -515,12 +516,13 @@ fn frontmatter_edit(
     })
 }
 
-/// Resolves the notebook root, opens it, and runs `act` on the note
-/// `resolve` picks inside it.
+/// Resolves the notebook root, opens it, takes its lock when `locks`
+/// asks for one, and runs `act` on the note `resolve` picks inside it.
 fn with_notebook(
     flag: Option<PathBuf>,
+    locks: Option<&Path>,
     resolve: impl FnOnce(&kladde::notebook::Notebook) -> Result<Note, kladde::notebook::Error>,
-    act: impl FnOnce(&Note) -> ExitCode,
+    act: impl FnOnce(&Note, Option<&kladde::write::Guard>) -> ExitCode,
 ) -> ExitCode {
     let root = match notebook_root(flag) {
         Ok(root) => root,
@@ -530,9 +532,26 @@ fn with_notebook(
         Ok(notebook) => notebook,
         Err(error) => return fail(error),
     };
-    match resolve(&notebook) {
-        Ok(note) => act(&note),
-        Err(error) => fail(error),
+    let lock = match locked(locks, notebook.root()) {
+        Ok(lock) => lock,
+        Err(error) => return fail(error),
+    };
+    let note = match resolve(&notebook) {
+        Ok(note) => note,
+        Err(error) => return fail(error),
+    };
+    let guard = lock.as_ref().map(|lock| lock.guard(&note));
+    act(&note, guard.as_ref())
+}
+
+/// The notebook's lock, when a write asked for one.
+fn locked(
+    locks: Option<&Path>,
+    root: &Path,
+) -> Result<Option<kladde::write::Lock>, kladde::write::Error> {
+    match locks {
+        Some(lock_dir) => Ok(Some(kladde::write::Lock::acquire(lock_dir, root)?)),
+        None => Ok(None),
     }
 }
 
@@ -544,7 +563,8 @@ type Note = kladde::notebook::NotePath;
 fn daily_note(
     date: Option<String>,
     flag: Option<PathBuf>,
-    act: impl FnOnce(&Note) -> ExitCode,
+    locks: Option<&Path>,
+    act: impl FnOnce(&Note, Option<&kladde::write::Guard>) -> ExitCode,
 ) -> ExitCode {
     let config = match loaded_config(flag.is_some()) {
         Ok(config) => config,
@@ -564,6 +584,7 @@ fn daily_note(
     let format = config.daily_date_format.unwrap_or_default();
     with_notebook(
         Some(root),
+        locks,
         |notebook| notebook.daily(day, config.daily_folder.as_deref(), &format),
         act,
     )
@@ -698,9 +719,17 @@ fn get(file: &Path, key: ConfigKey) -> ExitCode {
         }
         ConfigKey::StampExclude => {
             if let Some(entries) = config.stamp_exclude {
+                // Entries print with `/` on every platform, the spelling
+                // the config file stores, not the platform separator.
                 let joined = entries
                     .iter()
-                    .map(|entry| entry.display().to_string())
+                    .map(|entry| {
+                        entry
+                            .components()
+                            .map(|component| component.as_os_str().to_string_lossy())
+                            .collect::<Vec<_>>()
+                            .join("/")
+                    })
                     .collect::<Vec<_>>()
                     .join(",");
                 println!("{joined}");

@@ -154,14 +154,17 @@ pub fn set(text: &str, key: &str, value: &str) -> Result<String, Error> {
 ///
 /// # Errors
 ///
-/// Returns an error when `key` is not a valid property key or names
-/// duplicated properties.
+/// Returns an error when `key` is not a valid property key, names
+/// duplicated properties, or when the frontmatter is not property lines.
 pub fn unset(text: &str, key: &str) -> Result<String, Error> {
     validated_key(key)?;
     let mut document = parse(text);
     let Some(block) = &mut document.block else {
         return Ok(text.to_owned());
     };
+    if foreign_rooted(block) {
+        return Err(Error::ForeignBlock);
+    }
     if current_value(block, key)?.is_none() {
         return Ok(text.to_owned());
     }
@@ -209,8 +212,8 @@ pub fn add(text: &str, key: &str, item: &str) -> Result<String, Error> {
 /// # Errors
 ///
 /// Returns an error when `key` is not a valid property key, names
-/// duplicated properties, or holds a text or out-of-subset value, or
-/// when `item` spans lines.
+/// duplicated properties, or holds a text or out-of-subset value, when
+/// `item` spans lines, or when the frontmatter is not property lines.
 pub fn remove(text: &str, key: &str, item: &str) -> Result<String, Error> {
     validated_key(key)?;
     validated_value(item)?;
@@ -218,6 +221,9 @@ pub fn remove(text: &str, key: &str, item: &str) -> Result<String, Error> {
     let Some(block) = &mut document.block else {
         return Ok(text.to_owned());
     };
+    if foreign_rooted(block) {
+        return Err(Error::ForeignBlock);
+    }
     let Some(items) = current_list(block, key)? else {
         return Ok(text.to_owned());
     };
@@ -1565,8 +1571,11 @@ mod tests {
             "the frontmatter is a single value, not properties"
         );
         add(text, "k", "a").expect_err("add refuses");
-        assert_eq!(unset(text, "k").expect("unset succeeds"), text);
+        unset(text, "k").expect_err("unset refuses");
         assert_eq!(stamped(text, true, &stamp()), text);
+        let mixed = "---\n- item\nk: v\n---\n";
+        unset(mixed, "k").expect_err("unset refuses a trailing property");
+        remove(mixed, "k", "a").expect_err("remove refuses a trailing property");
         set("---\n[a, b]\n---\n", "k", "v").expect_err("flow sequence root refuses");
         set("---\n# c\n{foo: bar}\n---\n", "k", "v").expect_err("commented flow root refuses");
         let sequence = "---\n- a\n- b\n---\n";
