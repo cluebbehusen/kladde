@@ -35,6 +35,16 @@ fn kladde_state(state: &Path) -> Command {
     command
 }
 
+/// A `kladde` command with lock files under `state` and a config under
+/// `xdg` turning stamping off, so a write's bytes stay predictable. The
+/// stamping tests pin stamping itself.
+fn kladde_unstamped(state: &Path, xdg: &Path) -> Command {
+    write_config(xdg, "stamp = false\n");
+    let mut command = kladde_state(state);
+    command.env("XDG_CONFIG_HOME", xdg);
+    command
+}
+
 fn temp() -> TempDir {
     TempDir::new().expect("temp dir creates")
 }
@@ -1310,7 +1320,8 @@ fn path_rejects_conflicting_targets() {
 fn append_creates_a_missing_note() {
     let nb = temp();
     let state = temp();
-    kladde_state(state.path())
+    let xdg = temp();
+    kladde_unstamped(state.path(), xdg.path())
         .args(["append", "- first", "notes/new.md", "--notebook"])
         .arg(nb.path())
         .assert()
@@ -1327,8 +1338,9 @@ fn append_creates_a_missing_note() {
 fn append_appends_to_an_existing_note() {
     let nb = temp();
     let state = temp();
+    let xdg = temp();
     fs::write(nb.path().join("x.md"), "start\n").expect("fixture writes");
-    kladde_state(state.path())
+    kladde_unstamped(state.path(), xdg.path())
         .args(["append", "- next", "x.md", "--notebook"])
         .arg(nb.path())
         .assert()
@@ -1341,8 +1353,9 @@ fn append_appends_to_an_existing_note() {
 fn append_inserts_a_missing_separator() {
     let nb = temp();
     let state = temp();
+    let xdg = temp();
     fs::write(nb.path().join("x.md"), "no newline").expect("fixture writes");
-    kladde_state(state.path())
+    kladde_unstamped(state.path(), xdg.path())
         .args(["append", "- next", "x.md", "--notebook"])
         .arg(nb.path())
         .assert()
@@ -1355,7 +1368,8 @@ fn append_inserts_a_missing_separator() {
 fn append_strips_trailing_newlines_from_the_text() {
     let nb = temp();
     let state = temp();
-    kladde_state(state.path())
+    let xdg = temp();
+    kladde_unstamped(state.path(), xdg.path())
         .args(["append", "- entry\n\n", "x.md", "--notebook"])
         .arg(nb.path())
         .assert()
@@ -1368,7 +1382,8 @@ fn append_strips_trailing_newlines_from_the_text() {
 fn append_keeps_interior_newlines() {
     let nb = temp();
     let state = temp();
-    kladde_state(state.path())
+    let xdg = temp();
+    kladde_unstamped(state.path(), xdg.path())
         .args(["append", "- parent\n\t- child", "x.md", "--notebook"])
         .arg(nb.path())
         .assert()
@@ -1381,7 +1396,8 @@ fn append_keeps_interior_newlines() {
 fn append_accepts_flags_before_the_text() {
     let nb = temp();
     let state = temp();
-    kladde_state(state.path())
+    let xdg = temp();
+    kladde_unstamped(state.path(), xdg.path())
         .arg("append")
         .arg("--notebook")
         .arg(nb.path())
@@ -1397,7 +1413,8 @@ fn append_accepts_flags_before_the_text() {
 fn append_accepts_option_shaped_text_after_a_separator() {
     let nb = temp();
     let state = temp();
-    kladde_state(state.path())
+    let xdg = temp();
+    kladde_unstamped(state.path(), xdg.path())
         .arg("append")
         .arg("--notebook")
         .arg(nb.path())
@@ -1445,9 +1462,10 @@ fn append_rejects_conflicting_targets() {
 fn append_resolves_name() {
     let nb = temp();
     let state = temp();
+    let xdg = temp();
     fs::create_dir(nb.path().join("sub")).expect("fixture dir creates");
     fs::write(nb.path().join("sub").join("b.md"), "start\n").expect("fixture writes");
-    kladde_state(state.path())
+    kladde_unstamped(state.path(), xdg.path())
         .args(["append", "- found", "--name", "b", "--notebook"])
         .arg(nb.path())
         .assert()
@@ -1483,7 +1501,7 @@ fn append_daily_uses_configured_folder_and_format() {
     write_config(
         xdg.path(),
         &format!(
-            "default-notebook = '{}'\ndaily-folder = 'Journal'\ndaily-date-format = '%Y/%m/%d'\n",
+            "default-notebook = '{}'\ndaily-folder = 'Journal'\ndaily-date-format = '%Y/%m/%d'\nstamp = false\n",
             nb.path().display()
         ),
     );
@@ -1512,7 +1530,9 @@ fn append_daily_works_without_config_base_given_flag() {
         .assert()
         .success();
     let contents = fs::read_to_string(nb.path().join("2026-01-05.md")).expect("note reads");
-    assert_eq!(contents, "- daily\n");
+    assert!(contents.starts_with("---\ncreated: 2"), "{contents:?}");
+    assert!(contents.contains("\nupdated: 2"), "{contents:?}");
+    assert!(contents.ends_with("---\n- daily\n"), "{contents:?}");
 }
 
 #[test]
@@ -1638,11 +1658,12 @@ fn append_reports_an_obstructed_temp_path() {
 fn append_ignores_a_planted_temp_link() {
     let nb = temp();
     let state = temp();
+    let xdg = temp();
     let outside = temp();
     let precious = outside.path().join("precious");
     fs::write(&precious, "untouched").expect("fixture writes");
     std::os::unix::fs::symlink(&precious, nb.path().join(TEMP_X)).expect("symlink creates");
-    kladde_state(state.path())
+    kladde_unstamped(state.path(), xdg.path())
         .args(["append", "- x", "x.md", "--notebook"])
         .arg(nb.path())
         .assert()
@@ -1666,6 +1687,1618 @@ fn path_creates_nothing() {
         .assert()
         .success();
     assert!(!nb.path().join("missing.md").exists());
+}
+
+/// Runs `frontmatter get k` against a note holding `contents` and
+/// returns the assertion. Reads take no lock, so no state dir is set:
+/// success doubles as proof that reads work without one.
+fn get_k(nb: &TempDir, contents: &str) -> assert_cmd::assert::Assert {
+    fs::write(nb.path().join("x.md"), contents).expect("fixture writes");
+    kladde()
+        .args(["frontmatter", "get", "k", "x.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+}
+
+#[test]
+fn frontmatter_get_reads_scalar_shapes() {
+    let nb = temp();
+    let cases = [
+        ("---\nk: v\n---\n", "v\n"),
+        ("\u{feff}---\nk: v\n---\n", "v\n"),
+        ("---\r\nk: v\r\n---\r\nbody\r\n", "v\n"),
+        ("---\nk:   v  \n---\n", "v\n"),
+        ("---\nk:\n---\n", "\n"),
+        ("---\nk: \"a \\\"b\\\" \\\\ c\"\n---\n", "a \"b\" \\ c\n"),
+        ("---\nk: 'it''s'\n---\n", "it's\n"),
+        ("---\nk: -1\n---\n", "-1\n"),
+        ("---\nother: x\nk: v\n---\nbody\n", "v\n"),
+        ("---\nk: v\n\"other\": kept\n---\n", "v\n"),
+        ("---\n'k': v\n---\n", "v\n"),
+        ("---\n\"k\":\n---\n", "\n"),
+        ("---\nk: \"a\\/b\"\n---\n", "a/b\n"),
+        ("---\nk: \"a\\ b\"\n---\n", "a b\n"),
+        ("---\nk: \"a\\tb\"\n---\n", "a\tb\n"),
+        ("---\nk: \"a\\_b\"\n---\n", "a\u{a0}b\n"),
+        ("---\nk: \"\\x41\"\n---\n", "A\n"),
+        ("---\nk: \"\\u0064\"\n---\n", "d\n"),
+        ("---\nk: \"\\U0001F4DD\"\n---\n", "\u{1f4dd}\n"),
+        ("---\nk:\tv\n---\n", "v\n"),
+        ("---\n\"k\":\tv\n---\n", "v\n"),
+        ("---\nk: \u{a0}v\n---\n", "\u{a0}v\n"),
+        ("---\nk: old\n  # keep\n---\n", "old\n"),
+        ("---\n  # note\nk: v\n---\n", "v\n"),
+    ];
+    for (contents, expected) in cases {
+        get_k(&nb, contents).success().stdout(expected.to_owned());
+    }
+}
+
+#[test]
+fn frontmatter_get_reads_list_shapes() {
+    let nb = temp();
+    let cases = [
+        ("---\nk: [a, \"b c\", 'd']\n---\n", "a\nb c\nd\n"),
+        ("---\nk:\n  - a\n  - b c\n---\n", "a\nb c\n"),
+        ("---\nk:\n- a\n- b\n---\n", "a\nb\n"),
+        ("---\nk:\n  - a\n  -\n---\n", "a\n\n"),
+        ("---\nk: []\n---\n", ""),
+        ("---\nk:\n  - a\n\n# note\nother: x\n---\n", "a\n"),
+    ];
+    for (contents, expected) in cases {
+        get_k(&nb, contents).success().stdout(expected.to_owned());
+    }
+}
+
+#[test]
+fn frontmatter_get_misses_quietly() {
+    let nb = temp();
+    let cases = [
+        "body\n",
+        "",
+        "\n---\nk: v\n---\n",
+        "--- \nk: v\n---\n",
+        "---\nk: v\nbody\n",
+        "---\nk: v\n...\n",
+        "x\n---\nk: v\n---\n",
+        "---\n---\nbody\n",
+        "---\nk:value\n---\n",
+        "---\n# comment\n: v\nother: x\n---\n",
+        "---\n\"\": k\n---\n",
+        "---\n\"k\" v\n---\n",
+        "---\n\"k\" x: v\n---\n",
+        "---\nk\u{a0}: v\n---\n",
+    ];
+    for contents in cases {
+        get_k(&nb, contents).code(1).stdout("").stderr("");
+    }
+}
+
+#[test]
+fn frontmatter_get_misses_a_missing_note() {
+    let nb = temp();
+    kladde()
+        .args(["frontmatter", "get", "k", "missing.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .code(1)
+        .stdout("")
+        .stderr("");
+    assert!(!nb.path().join("missing.md").exists());
+}
+
+#[test]
+fn frontmatter_get_rejects_out_of_subset_values() {
+    let nb = temp();
+    let cases = [
+        "---\nk:\n  sub: x\n---\n",
+        "---\nk: v\n  continued\n---\n",
+        "---\nk: |\n  text\n---\n",
+        "---\nk: >\n  text\n---\n",
+        "---\nk: |\n---\n",
+        "---\nk: {a: b}\n---\n",
+        "---\nk: v # note\n---\n",
+        "---\nk: &anchor\n---\n",
+        "---\nk: *alias\n---\n",
+        "---\nk: \"a \\q\"\n---\n",
+        "---\nk: \"a\n---\n",
+        "---\nk: 'a\n---\n",
+        "---\nk: \"a\" b\n---\n",
+        "---\nk: 'a' b\n---\n",
+        "---\nk: [[a], b]\n---\n",
+        "---\nk: [a, {b: c}]\n---\n",
+        "---\nk: [a,]\n---\n",
+        "---\nk: [a, , b]\n---\n",
+        "---\nk: [a\n---\n",
+        "---\nk: [\"a\" b]\n---\n",
+        "---\nk:\n  - a\n    - b\n---\n",
+        "---\nk:\n  - a\n  # note\n  - b\n---\n",
+        "---\nk:\n  - a\n\n  - b\n---\n",
+        "---\nk:\n  - a # note\n---\n",
+        "---\nk:\n  - name: Alice\n---\n",
+        "---\nk:\n  - - a\n---\n",
+        "---\nk:\n  - [a, b]\n---\n",
+        "---\nk: [a: b]\n---\n",
+        "---\nk: a: b\n---\n",
+        "---\nk: a\tb\n---\n",
+        "---\nk: a\u{7}b\n---\n",
+        "---\nk: \"a\u{1b}[31mb\"\n---\n",
+        "---\nk: 'a\u{7}b'\n---\n",
+        "---\nk: [a\u{7}b]\n---\n",
+        "---\nk: \"a\\0b\"\n---\n",
+        "---\nk: \"a\\ab\"\n---\n",
+        "---\nk: \"a\\bb\"\n---\n",
+        "---\nk: \"a\\nb\"\n---\n",
+        "---\nk: \"a\\vb\"\n---\n",
+        "---\nk: \"a\\fb\"\n---\n",
+        "---\nk: \"a\\rb\"\n---\n",
+        "---\nk: \"a\\eb\"\n---\n",
+        "---\nk: \"a\\Nb\"\n---\n",
+        "---\nk: \"a\\Lb\"\n---\n",
+        "---\nk: \"a\\Pb\"\n---\n",
+        "---\nk: \"\\uD800\"\n---\n",
+        "---\nk: a\u{fffe}b\n---\n",
+        "---\nk: a\u{2028}b\n---\n",
+        "---\nk: \"\\uFFFF\"\n---\n",
+        "---\nk:\n\t- a\n---\n",
+        "---\nk:\n  - a\n  # trailing\n---\n",
+    ];
+    for contents in cases {
+        get_k(&nb, contents)
+            .code(1)
+            .stderr(contains("is not a text or list value"));
+    }
+}
+
+/// YAML trims whitespace between a key and its colon, so kladde finds
+/// the property under its trimmed name and rewrites it canonically.
+#[test]
+fn frontmatter_finds_a_key_padded_before_its_colon() {
+    let nb = temp();
+    let state = temp();
+    let xdg = temp();
+    get_k(&nb, "---\nk : draft\n---\n")
+        .success()
+        .stdout("draft\n");
+    kladde_unstamped(state.path(), xdg.path())
+        .args(["frontmatter", "set", "k", "done", "x.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success();
+    assert_eq!(
+        fs::read_to_string(nb.path().join("x.md")).expect("note reads"),
+        "---\nk: done\n---\n"
+    );
+}
+
+/// Lines the edit does not target stay byte-identical, whether the
+/// parser recognizes them (a quoted key) or not (a stray dash line).
+#[test]
+fn frontmatter_set_leaves_unrecognized_neighbors_alone() {
+    let nb = temp();
+    let state = temp();
+    let xdg = temp();
+    fs::write(
+        nb.path().join("x.md"),
+        "---\nk: old\n- stray\n\"other\": kept\n\u{a0}nb: kept\n---\nbody\n",
+    )
+    .expect("fixture writes");
+    kladde_unstamped(state.path(), xdg.path())
+        .args(["frontmatter", "set", "k", "new", "x.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success();
+    assert_eq!(
+        fs::read_to_string(nb.path().join("x.md")).expect("note reads"),
+        "---\nk: new\n- stray\n\"other\": kept\n\u{a0}nb: kept\n---\nbody\n"
+    );
+}
+
+/// A block rooted in anything but property lines is preserved whole:
+/// appends land in the body unstamped, and property edits refuse.
+#[test]
+fn frontmatter_never_edits_foreign_blocks() {
+    let nb = temp();
+    let state = temp();
+    let xdg = temp();
+    write_config(xdg.path(), "stamp-format = 'X'\n");
+    fs::write(nb.path().join("q.md"), "---\n{foo: bar}\n---\nbody\n").expect("fixture writes");
+    kladde_state(state.path())
+        .env("XDG_CONFIG_HOME", xdg.path())
+        .args(["append", "- x", "q.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success();
+    assert_eq!(
+        fs::read_to_string(nb.path().join("q.md")).expect("note reads"),
+        "---\n{foo: bar}\n---\nbody\n- x\n"
+    );
+    kladde_state(state.path())
+        .args(["frontmatter", "set", "k", "v", "q.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .code(1)
+        .stderr(contains("single value, not properties"));
+    kladde_state(state.path())
+        .args(["frontmatter", "add", "k", "a", "q.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .code(1)
+        .stderr(contains("single value, not properties"));
+    fs::write(nb.path().join("s.md"), "---\n[a, b]\n---\n").expect("fixture writes");
+    kladde_state(state.path())
+        .args(["frontmatter", "set", "k", "v", "s.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .code(1)
+        .stderr(contains("single value, not properties"));
+    fs::write(nb.path().join("c.md"), "---\n# c\n{foo: bar}\n---\n").expect("fixture writes");
+    kladde_state(state.path())
+        .args(["frontmatter", "set", "k", "v", "c.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .code(1)
+        .stderr(contains("single value, not properties"));
+    fs::write(nb.path().join("seq.md"), "---\n- a\n- b\n---\nbody\n").expect("fixture writes");
+    kladde_state(state.path())
+        .env("XDG_CONFIG_HOME", xdg.path())
+        .args(["append", "- x", "seq.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success();
+    assert_eq!(
+        fs::read_to_string(nb.path().join("seq.md")).expect("note reads"),
+        "---\n- a\n- b\n---\nbody\n- x\n"
+    );
+    fs::write(nb.path().join("sc.md"), "---\njust a scalar\n---\n").expect("fixture writes");
+    kladde_state(state.path())
+        .args(["frontmatter", "set", "k", "v", "sc.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .code(1)
+        .stderr(contains("single value, not properties"));
+    fs::write(nb.path().join("m.md"), "---\n- item\nk: v\n---\n").expect("fixture writes");
+    kladde_state(state.path())
+        .args(["frontmatter", "unset", "k", "m.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .code(1)
+        .stderr(contains("single value, not properties"));
+    kladde_state(state.path())
+        .args(["frontmatter", "remove", "k", "a", "m.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .code(1)
+        .stderr(contains("single value, not properties"));
+    assert_eq!(
+        fs::read_to_string(nb.path().join("m.md")).expect("note reads"),
+        "---\n- item\nk: v\n---\n"
+    );
+    fs::write(
+        nb.path().join("an.md"),
+        "---\n&props {foo: bar}\n---\nbody\n",
+    )
+    .expect("fixture writes");
+    kladde_state(state.path())
+        .env("XDG_CONFIG_HOME", xdg.path())
+        .args(["append", "- x", "an.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success();
+    assert_eq!(
+        fs::read_to_string(nb.path().join("an.md")).expect("note reads"),
+        "---\n&props {foo: bar}\n---\nbody\n- x\n"
+    );
+    kladde_state(state.path())
+        .args(["frontmatter", "set", "k", "v", "an.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .code(1)
+        .stderr(contains("single value, not properties"));
+}
+
+/// Setting one property never overwrites a different one whose key ends
+/// in wide whitespace: the no-break space is part of the name.
+#[test]
+fn frontmatter_set_leaves_wide_whitespace_keys_alone() {
+    let nb = temp();
+    let state = temp();
+    let xdg = temp();
+    fs::write(nb.path().join("x.md"), "---\na\u{a0}: kept\n---\n").expect("fixture writes");
+    kladde_unstamped(state.path(), xdg.path())
+        .args(["frontmatter", "set", "a", "v", "x.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success();
+    assert_eq!(
+        fs::read_to_string(nb.path().join("x.md")).expect("note reads"),
+        "---\na\u{a0}: kept\na: v\n---\n"
+    );
+    fs::write(nb.path().join("y.md"), "---\nk: \u{a0}\n- raw\n---\n").expect("fixture writes");
+    kladde_unstamped(state.path(), xdg.path())
+        .args(["frontmatter", "set", "k", "new", "y.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success();
+    assert_eq!(
+        fs::read_to_string(nb.path().join("y.md")).expect("note reads"),
+        "---\nk: new\n- raw\n---\n"
+    );
+}
+
+#[test]
+fn frontmatter_rejects_control_characters_in_values() {
+    let nb = temp();
+    let state = temp();
+    kladde_state(state.path())
+        .args(["frontmatter", "set", "k", "a\u{7}b", "x.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .code(1)
+        .stderr(contains("cannot hold unprintable characters"));
+    kladde_state(state.path())
+        .args([
+            "frontmatter",
+            "set",
+            "k",
+            "a\u{2028}b",
+            "x.md",
+            "--notebook",
+        ])
+        .arg(nb.path())
+        .assert()
+        .code(1)
+        .stderr(contains("cannot hold unprintable characters"));
+    assert!(!nb.path().join("x.md").exists());
+}
+
+#[test]
+fn frontmatter_get_rejects_duplicates() {
+    let nb = temp();
+    get_k(&nb, "---\nk: a\nk: b\n---\n")
+        .code(1)
+        .stderr(contains("multiple properties named \"k\""));
+}
+
+#[test]
+fn frontmatter_rejects_invalid_keys() {
+    let nb = temp();
+    let cases = [
+        ("", "it is empty"),
+        ("a:b", "it contains a colon"),
+        ("a#b", "it contains a hash"),
+        ("a\nb", "it contains a line break"),
+        ("a\tb", "it contains an unprintable character"),
+        ("a\u{fffe}b", "it contains an unprintable character"),
+        ("a\u{2028}b", "it contains an unprintable character"),
+        (" a", "it has leading or trailing whitespace"),
+        ("-a", "it starts with a character YAML reserves"),
+        ("'a", "it starts with a character YAML reserves"),
+        ("@a", "it starts with a character YAML reserves"),
+        ("[a", "it starts with a character YAML reserves"),
+    ];
+    for (key, reason) in cases {
+        kladde()
+            .args(["frontmatter", "get", "--notebook"])
+            .arg(nb.path())
+            .args(["--", key, "x.md"])
+            .assert()
+            .code(1)
+            .stderr(contains(reason));
+    }
+}
+
+#[test]
+fn frontmatter_get_reports_an_unreadable_note() {
+    let nb = temp();
+    fs::write(nb.path().join("x.md"), [0xff, 0xfe, 0xfd]).expect("fixture writes");
+    kladde()
+        .args(["frontmatter", "get", "k", "x.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .code(1)
+        .stderr(contains("cannot read"));
+}
+
+#[test]
+fn frontmatter_set_creates_the_note_with_parents() {
+    let nb = temp();
+    let state = temp();
+    let xdg = temp();
+    kladde_unstamped(state.path(), xdg.path())
+        .args(["frontmatter", "set", "k", "v", "a/b/c.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success()
+        .stdout(format!(
+            "{}\n",
+            canonical(nb.path())
+                .join("a")
+                .join("b")
+                .join("c.md")
+                .display()
+        ));
+    let contents =
+        fs::read_to_string(nb.path().join("a").join("b").join("c.md")).expect("note reads");
+    assert_eq!(contents, "---\nk: v\n---\n");
+}
+
+#[test]
+fn frontmatter_set_edits_only_the_named_property() {
+    let nb = temp();
+    let state = temp();
+    let xdg = temp();
+    let cases = [
+        (
+            "---\na: 'kept'\n# note\nk: old\nz:\n  - kept\n---\nbody\n",
+            "---\na: 'kept'\n# note\nk: v\nz:\n  - kept\n---\nbody\n",
+        ),
+        ("---\nk:\n  - a\n---\n", "---\nk: v\n---\n"),
+        ("---\nk:\n  sub: x\n---\n", "---\nk: v\n---\n"),
+        ("---\na: x\n---\n", "---\na: x\nk: v\n---\n"),
+        ("---\n---\nbody\n", "---\nk: v\n---\nbody\n"),
+        ("body\n", "---\nk: v\n---\nbody\n"),
+        ("---\nnot closed\n", "---\nk: v\n---\n---\nnot closed\n"),
+        ("---\nk: |\n  old\n  # c\n---\n", "---\nk: v\n---\n"),
+        ("---\nk: old\n  # keep\n---\n", "---\nk: v\n  # keep\n---\n"),
+        ("---\n  # note\nk: old\n---\n", "---\n  # note\nk: v\n---\n"),
+        ("\u{feff}---\na: x\n---\n", "\u{feff}---\na: x\nk: v\n---\n"),
+        ("\u{feff}body\n", "\u{feff}---\nk: v\n---\nbody\n"),
+        (
+            "---\r\na: x\r\n---\r\nbody\r\n",
+            "---\r\na: x\r\nk: v\r\n---\r\nbody\r\n",
+        ),
+    ];
+    for (before, after) in cases {
+        fs::write(nb.path().join("x.md"), before).expect("fixture writes");
+        kladde_unstamped(state.path(), xdg.path())
+            .args(["frontmatter", "set", "k", "v", "x.md", "--notebook"])
+            .arg(nb.path())
+            .assert()
+            .success();
+        let contents = fs::read_to_string(nb.path().join("x.md")).expect("note reads");
+        assert_eq!(contents, after, "for {before:?}");
+    }
+}
+
+#[test]
+fn frontmatter_set_quotes_only_when_needed() {
+    let nb = temp();
+    let state = temp();
+    let xdg = temp();
+    let cases = [
+        ("[[Link]]", "k: \"[[Link]]\""),
+        ("", "k: \"\""),
+        ("a\tb", "k: \"a\tb\""),
+        ("true", "k: true"),
+    ];
+    for (value, line) in cases {
+        fs::write(nb.path().join("x.md"), "").expect("fixture writes");
+        kladde_unstamped(state.path(), xdg.path())
+            .args(["frontmatter", "set", "k", value, "x.md", "--notebook"])
+            .arg(nb.path())
+            .assert()
+            .success();
+        let contents = fs::read_to_string(nb.path().join("x.md")).expect("note reads");
+        assert_eq!(contents, format!("---\n{line}\n---\n"));
+    }
+}
+
+#[test]
+fn frontmatter_set_takes_hyphen_values() {
+    let nb = temp();
+    let state = temp();
+    let xdg = temp();
+    kladde_unstamped(state.path(), xdg.path())
+        .args(["frontmatter", "set", "k", "-v", "x.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success();
+    let contents = fs::read_to_string(nb.path().join("x.md")).expect("note reads");
+    assert_eq!(contents, "---\nk: -v\n---\n");
+}
+
+#[test]
+fn frontmatter_set_rejects_a_multiline_value() {
+    let nb = temp();
+    let state = temp();
+    kladde_state(state.path())
+        .args(["frontmatter", "set", "k", "a\nb", "x.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .code(1)
+        .stderr(contains("property values are single lines"));
+    kladde_state(state.path())
+        .args(["frontmatter", "set", "k", "a\rb", "x.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .code(1)
+        .stderr(contains("property values are single lines"));
+    assert!(!nb.path().join("x.md").exists());
+}
+
+#[test]
+fn frontmatter_set_rejects_duplicates() {
+    let nb = temp();
+    let state = temp();
+    fs::write(nb.path().join("x.md"), "---\nk: a\nk: b\n---\n").expect("fixture writes");
+    kladde_state(state.path())
+        .args(["frontmatter", "set", "k", "v", "x.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .code(1)
+        .stderr(contains("multiple properties named \"k\""));
+}
+
+#[test]
+fn frontmatter_unset_removes_the_property() {
+    let nb = temp();
+    let state = temp();
+    let xdg = temp();
+    fs::write(nb.path().join("x.md"), "---\na: x\nk: v\n---\nbody\n").expect("fixture writes");
+    kladde_unstamped(state.path(), xdg.path())
+        .args(["frontmatter", "unset", "k", "x.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success();
+    let contents = fs::read_to_string(nb.path().join("x.md")).expect("note reads");
+    assert_eq!(contents, "---\na: x\n---\nbody\n");
+}
+
+#[test]
+fn frontmatter_unset_removes_the_fences_with_the_last_property() {
+    let nb = temp();
+    let state = temp();
+    fs::write(nb.path().join("x.md"), "---\nk: v\n---\nbody\n").expect("fixture writes");
+    kladde_state(state.path())
+        .args(["frontmatter", "unset", "k", "x.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success();
+    let contents = fs::read_to_string(nb.path().join("x.md")).expect("note reads");
+    assert_eq!(contents, "body\n");
+}
+
+#[test]
+fn frontmatter_unset_keeps_fences_holding_other_lines() {
+    let nb = temp();
+    let state = temp();
+    let xdg = temp();
+    fs::write(nb.path().join("x.md"), "---\n# note\nk: v\n---\n").expect("fixture writes");
+    kladde_unstamped(state.path(), xdg.path())
+        .args(["frontmatter", "unset", "k", "x.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success();
+    let contents = fs::read_to_string(nb.path().join("x.md")).expect("note reads");
+    assert_eq!(contents, "---\n# note\n---\n");
+}
+
+#[test]
+fn frontmatter_unset_of_a_missing_property_changes_nothing() {
+    let nb = temp();
+    let state = temp();
+    let text = "---\na: x\n---\n";
+    fs::write(nb.path().join("x.md"), text).expect("fixture writes");
+    kladde_state(state.path())
+        .args(["frontmatter", "unset", "k", "x.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success();
+    assert_eq!(
+        fs::read_to_string(nb.path().join("x.md")).expect("note reads"),
+        text
+    );
+}
+
+#[test]
+fn frontmatter_unset_of_a_missing_note_creates_nothing() {
+    let nb = temp();
+    let state = temp();
+    kladde_state(state.path())
+        .args(["frontmatter", "unset", "k", "missing.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success();
+    assert!(!nb.path().join("missing.md").exists());
+}
+
+#[test]
+fn frontmatter_add_creates_and_extends_the_list() {
+    let nb = temp();
+    let state = temp();
+    let xdg = temp();
+    kladde_unstamped(state.path(), xdg.path())
+        .args(["frontmatter", "add", "tags", "rust", "x.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success();
+    kladde_unstamped(state.path(), xdg.path())
+        .args(["frontmatter", "add", "tags", "b c", "x.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success();
+    let contents = fs::read_to_string(nb.path().join("x.md")).expect("note reads");
+    assert_eq!(contents, "---\ntags:\n  - rust\n  - b c\n---\n");
+}
+
+#[test]
+fn frontmatter_add_rewrites_inline_and_empty_lists_in_block_style() {
+    let nb = temp();
+    let state = temp();
+    let xdg = temp();
+    let cases = [
+        ("---\nk: [a]\n---\n", "---\nk:\n  - a\n  - b\n---\n"),
+        ("---\nk: []\n---\n", "---\nk:\n  - b\n---\n"),
+    ];
+    for (before, after) in cases {
+        fs::write(nb.path().join("x.md"), before).expect("fixture writes");
+        kladde_unstamped(state.path(), xdg.path())
+            .args(["frontmatter", "add", "k", "b", "x.md", "--notebook"])
+            .arg(nb.path())
+            .assert()
+            .success();
+        let contents = fs::read_to_string(nb.path().join("x.md")).expect("note reads");
+        assert_eq!(contents, after, "for {before:?}");
+    }
+}
+
+#[test]
+fn frontmatter_add_of_a_present_item_changes_nothing() {
+    let nb = temp();
+    let state = temp();
+    let text = "---\nk: [a]\n---\n";
+    fs::write(nb.path().join("x.md"), text).expect("fixture writes");
+    kladde_state(state.path())
+        .args(["frontmatter", "add", "k", "a", "x.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success();
+    let contents = fs::read_to_string(nb.path().join("x.md")).expect("note reads");
+    assert_eq!(contents, text);
+}
+
+#[test]
+fn frontmatter_add_rejects_non_lists() {
+    let nb = temp();
+    let state = temp();
+    fs::write(nb.path().join("x.md"), "---\nk: v\n---\n").expect("fixture writes");
+    kladde_state(state.path())
+        .args(["frontmatter", "add", "k", "a", "x.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .code(1)
+        .stderr(contains("property \"k\" is not a list"));
+    fs::write(nb.path().join("x.md"), "---\nk:\n  sub: x\n---\n").expect("fixture writes");
+    kladde_state(state.path())
+        .args(["frontmatter", "add", "k", "a", "x.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .code(1)
+        .stderr(contains("is not a text or list value"));
+}
+
+#[test]
+fn frontmatter_remove_removes_items_down_to_an_empty_list() {
+    let nb = temp();
+    let state = temp();
+    let xdg = temp();
+    fs::write(nb.path().join("x.md"), "---\nk:\n  - a\n  - b\n---\n").expect("fixture writes");
+    kladde_unstamped(state.path(), xdg.path())
+        .args(["frontmatter", "remove", "k", "a", "x.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success();
+    assert_eq!(
+        fs::read_to_string(nb.path().join("x.md")).expect("note reads"),
+        "---\nk:\n  - b\n---\n"
+    );
+    kladde_unstamped(state.path(), xdg.path())
+        .args(["frontmatter", "remove", "k", "b", "x.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success();
+    assert_eq!(
+        fs::read_to_string(nb.path().join("x.md")).expect("note reads"),
+        "---\nk: []\n---\n"
+    );
+}
+
+#[test]
+fn frontmatter_remove_of_an_absent_item_changes_nothing() {
+    let nb = temp();
+    let state = temp();
+    let text = "---\nk:\n  - a\n---\nbody\n";
+    fs::write(nb.path().join("x.md"), text).expect("fixture writes");
+    kladde_state(state.path())
+        .args(["frontmatter", "remove", "k", "b", "x.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success();
+    assert_eq!(
+        fs::read_to_string(nb.path().join("x.md")).expect("note reads"),
+        text
+    );
+    kladde_state(state.path())
+        .args(["frontmatter", "remove", "other", "b", "x.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success();
+    assert_eq!(
+        fs::read_to_string(nb.path().join("x.md")).expect("note reads"),
+        text
+    );
+}
+
+#[test]
+fn frontmatter_remove_of_a_missing_note_creates_nothing() {
+    let nb = temp();
+    let state = temp();
+    kladde_state(state.path())
+        .args([
+            "frontmatter",
+            "remove",
+            "k",
+            "a",
+            "missing.md",
+            "--notebook",
+        ])
+        .arg(nb.path())
+        .assert()
+        .success();
+    assert!(!nb.path().join("missing.md").exists());
+}
+
+#[test]
+fn frontmatter_remove_rejects_a_text_property() {
+    let nb = temp();
+    let state = temp();
+    fs::write(nb.path().join("x.md"), "---\nk: v\n---\n").expect("fixture writes");
+    kladde_state(state.path())
+        .args(["frontmatter", "remove", "k", "a", "x.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .code(1)
+        .stderr(contains("property \"k\" is not a list"));
+}
+
+#[test]
+fn frontmatter_set_requires_a_notebook() {
+    let state = temp();
+    let xdg = temp();
+    kladde_state(state.path())
+        .env("XDG_CONFIG_HOME", xdg.path())
+        .args(["frontmatter", "set", "k", "v", "x.md"])
+        .assert()
+        .code(1)
+        .stderr(contains("no notebook"));
+}
+
+#[test]
+fn frontmatter_set_reports_an_unopenable_notebook() {
+    let state = temp();
+    let base = temp();
+    kladde_state(state.path())
+        .args(["frontmatter", "set", "k", "v", "x.md", "--notebook"])
+        .arg(base.path().join("missing"))
+        .assert()
+        .code(1)
+        .stderr(contains("cannot open notebook"));
+}
+
+#[test]
+fn frontmatter_set_rejects_an_escaping_target() {
+    let nb = temp();
+    let state = temp();
+    kladde_state(state.path())
+        .args(["frontmatter", "set", "k", "v", "..", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .code(1)
+        .stderr(contains("cannot leave the notebook"));
+}
+
+#[test]
+fn frontmatter_mutations_need_a_state_dir() {
+    let nb = temp();
+    kladde()
+        .args(["frontmatter", "set", "k", "v", "x.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .code(1)
+        .stderr(contains("cannot locate the state directory"));
+    assert!(!nb.path().join("x.md").exists());
+}
+
+#[test]
+fn frontmatter_set_reports_an_obstructed_lock_dir() {
+    let nb = temp();
+    let state = temp();
+    fs::create_dir(state.path().join("kladde")).expect("fixture dir creates");
+    fs::write(state.path().join("kladde").join("locks"), "").expect("fixture writes");
+    kladde_state(state.path())
+        .args(["frontmatter", "set", "k", "v", "x.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .code(1)
+        .stderr(contains("cannot create lock directory"));
+}
+
+#[test]
+fn frontmatter_set_reports_an_unreadable_note() {
+    let nb = temp();
+    let state = temp();
+    fs::write(nb.path().join("x.md"), [0xff, 0xfe, 0xfd]).expect("fixture writes");
+    kladde_state(state.path())
+        .args(["frontmatter", "set", "k", "v", "x.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .code(1)
+        .stderr(contains("cannot read"));
+}
+
+#[test]
+fn frontmatter_set_reports_an_obstructed_temp_path() {
+    let nb = temp();
+    let state = temp();
+    fs::create_dir(nb.path().join(TEMP_X)).expect("fixture dir creates");
+    kladde_state(state.path())
+        .args(["frontmatter", "set", "k", "v", "x.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .code(1)
+        .stderr(contains("cannot write"));
+}
+
+#[test]
+fn frontmatter_targets_notes_by_name_and_date() {
+    let nb = temp();
+    let state = temp();
+    let xdg = temp();
+    fs::create_dir(nb.path().join("deep")).expect("fixture dir creates");
+    fs::write(nb.path().join("deep").join("named.md"), "").expect("fixture writes");
+    kladde_unstamped(state.path(), xdg.path())
+        .args([
+            "frontmatter",
+            "set",
+            "k",
+            "v",
+            "--name",
+            "named",
+            "--notebook",
+        ])
+        .arg(nb.path())
+        .assert()
+        .success();
+    kladde()
+        .args(["frontmatter", "get", "k", "--name", "named", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success()
+        .stdout("v\n");
+    kladde_unstamped(state.path(), xdg.path())
+        .args([
+            "frontmatter",
+            "set",
+            "k",
+            "v",
+            "--date",
+            "2026-01-05",
+            "--notebook",
+        ])
+        .arg(nb.path())
+        .assert()
+        .success();
+    assert_eq!(
+        fs::read_to_string(nb.path().join("2026-01-05.md")).expect("note reads"),
+        "---\nk: v\n---\n"
+    );
+}
+
+/// Every verb reaches a note through the daily and name routes, not just
+/// a relative path.
+#[test]
+fn frontmatter_verbs_reach_daily_and_named_notes() {
+    let nb = temp();
+    let state = temp();
+    let xdg = temp();
+    let steps: [(&[&str], &str); 4] = [
+        (&["add", "k", "a"], "---\nk:\n  - a\n---\n"),
+        (&["remove", "k", "a"], "---\nk: []\n---\n"),
+        (&["set", "k", "v"], "---\nk: v\n---\n"),
+        (&["unset", "k"], ""),
+    ];
+    for (verb, expected) in steps {
+        kladde_unstamped(state.path(), xdg.path())
+            .arg("frontmatter")
+            .args(verb)
+            .args(["--date", "2026-01-05", "--notebook"])
+            .arg(nb.path())
+            .assert()
+            .success();
+        assert_eq!(
+            fs::read_to_string(nb.path().join("2026-01-05.md")).expect("note reads"),
+            expected
+        );
+    }
+    kladde()
+        .args([
+            "frontmatter",
+            "get",
+            "k",
+            "--date",
+            "2026-01-05",
+            "--notebook",
+        ])
+        .arg(nb.path())
+        .assert()
+        .code(1)
+        .stdout("");
+    fs::write(nb.path().join("named.md"), "---\nk:\n  - a\n---\n").expect("fixture writes");
+    for (verb, expected) in [
+        (["add", "k", "b"].as_slice(), "---\nk:\n  - a\n  - b\n---\n"),
+        (&["remove", "k", "a"], "---\nk:\n  - b\n---\n"),
+        (&["unset", "k"], ""),
+    ] {
+        kladde_unstamped(state.path(), xdg.path())
+            .arg("frontmatter")
+            .args(verb)
+            .args(["--name", "named", "--notebook"])
+            .arg(nb.path())
+            .assert()
+            .success();
+        assert_eq!(
+            fs::read_to_string(nb.path().join("named.md")).expect("note reads"),
+            expected
+        );
+    }
+}
+
+#[test]
+fn frontmatter_set_by_name_never_creates() {
+    let nb = temp();
+    let state = temp();
+    kladde_state(state.path())
+        .args([
+            "frontmatter",
+            "set",
+            "k",
+            "v",
+            "--name",
+            "nope",
+            "--notebook",
+        ])
+        .arg(nb.path())
+        .assert()
+        .code(1)
+        .stderr(contains("no note named \"nope\""));
+    let entries = fs::read_dir(nb.path()).expect("notebook reads");
+    assert_eq!(entries.count(), 0);
+}
+
+#[test]
+fn config_stamp_keys_round_trip() {
+    let xdg = temp();
+    let cases = [
+        ("stamp", "false", "false\n"),
+        ("stamp-created-key", "made", "made\n"),
+        ("stamp-updated-key", "touched", "touched\n"),
+        ("stamp-format", "%Y-%m-%dT%H:%M", "%Y-%m-%dT%H:%M\n"),
+        (
+            "stamp-exclude",
+            "templates, archive/2026",
+            "templates,archive/2026\n",
+        ),
+    ];
+    for (key, value, printed) in cases {
+        kladde_in(xdg.path())
+            .args(["config", "get", key])
+            .assert()
+            .code(1)
+            .stdout("");
+        kladde_in(xdg.path())
+            .args(["config", "set", key, value])
+            .assert()
+            .success();
+        kladde_in(xdg.path())
+            .args(["config", "get", key])
+            .assert()
+            .success()
+            .stdout(printed.to_owned());
+        kladde_in(xdg.path())
+            .args(["config", "unset", key])
+            .assert()
+            .success();
+        kladde_in(xdg.path())
+            .args(["config", "get", key])
+            .assert()
+            .code(1)
+            .stdout("");
+    }
+}
+
+#[test]
+fn config_set_rejects_bad_stamp_values() {
+    let xdg = temp();
+    let cases = [
+        ("stamp", "maybe", "must be true or false"),
+        ("stamp-created-key", "a:b", "it contains a colon"),
+        ("stamp-updated-key", " a", "leading or trailing whitespace"),
+        ("stamp-format", "%Q", "is invalid"),
+        ("stamp-format", "", "renders nothing"),
+        ("stamp-format", "%Y\n%m", "renders an unprintable character"),
+        (
+            "stamp-format",
+            "a\u{7}b",
+            "renders an unprintable character",
+        ),
+        (
+            "stamp-format",
+            "a\u{fffe}b",
+            "renders an unprintable character",
+        ),
+        (
+            "stamp-format",
+            "a\u{2028}b",
+            "renders an unprintable character",
+        ),
+        ("stamp-exclude", "", "must not be empty"),
+        ("stamp-exclude", "/abs", "must be relative paths"),
+        (
+            "stamp-exclude",
+            "..",
+            "must name a place inside the notebook",
+        ),
+        (
+            "stamp-exclude",
+            "a/../b",
+            "must name a place inside the notebook",
+        ),
+        (
+            "stamp-exclude",
+            ".",
+            "must name a place inside the notebook",
+        ),
+    ];
+    for (key, value, fragment) in cases {
+        kladde_in(xdg.path())
+            .args(["config", "set", key, value])
+            .assert()
+            .code(1)
+            .stderr(contains(fragment));
+    }
+    assert!(!config_file(xdg.path()).exists());
+}
+
+#[test]
+fn config_load_rejects_bad_stamp_values() {
+    let xdg = temp();
+    let cases = [
+        ("stamp = 'yes'\n", "`stamp` must be true or false"),
+        ("stamp-created-key = 1\n", "must be a string"),
+        ("stamp-updated-key = 1\n", "must be a string"),
+        ("stamp-created-key = 'a:b'\n", "invalid property key"),
+        ("stamp-updated-key = 'a#b'\n", "invalid property key"),
+        ("stamp-format = 1\n", "must be a string"),
+        ("stamp-format = '%Q'\n", "timestamp format"),
+        ("stamp-exclude = 'x'\n", "must be an array of strings"),
+        ("stamp-exclude = [1]\n", "must be an array of strings"),
+        ("stamp-exclude = ['/abs']\n", "must be relative paths"),
+        ("stamp-exclude = ['']\n", "must not be empty"),
+        (
+            "stamp-exclude = ['..']\n",
+            "must name a place inside the notebook",
+        ),
+    ];
+    for (contents, fragment) in cases {
+        write_config(xdg.path(), contents);
+        kladde_in(xdg.path())
+            .args(["config", "get", "stamp"])
+            .assert()
+            .code(1)
+            .stderr(contains(fragment));
+    }
+}
+
+/// Stamping is on with no config at all: a write that creates a note
+/// gives it a block holding both stamps in the default datetime shape.
+#[test]
+fn stamping_is_on_by_default() {
+    let nb = temp();
+    let state = temp();
+    kladde_state(state.path())
+        .args(["frontmatter", "set", "k", "v", "x.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success();
+    let contents = fs::read_to_string(nb.path().join("x.md")).expect("note reads");
+    assert!(
+        contents.starts_with("---\nk: v\ncreated: 2"),
+        "{contents:?}"
+    );
+    assert!(contents.contains("\nupdated: 2"), "{contents:?}");
+    assert!(contents.ends_with("---\n"), "{contents:?}");
+}
+
+/// A stamp format without directives renders the same value every run,
+/// making stamped bytes exact.
+#[test]
+fn stamping_uses_the_configured_keys_and_format() {
+    let nb = temp();
+    let state = temp();
+    let xdg = temp();
+    write_config(
+        xdg.path(),
+        "stamp-created-key = 'made'\nstamp-updated-key = 'touched'\nstamp-format = 'X'\n",
+    );
+    kladde_state(state.path())
+        .env("XDG_CONFIG_HOME", xdg.path())
+        .args(["frontmatter", "set", "k", "v", "x.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success();
+    let contents = fs::read_to_string(nb.path().join("x.md")).expect("note reads");
+    assert_eq!(contents, "---\nk: v\nmade: X\ntouched: X\n---\n");
+}
+
+#[test]
+fn append_stamps_a_new_note_and_refreshes_updated() {
+    let nb = temp();
+    let state = temp();
+    let xdg = temp();
+    write_config(xdg.path(), "stamp-format = 'A'\n");
+    kladde_state(state.path())
+        .env("XDG_CONFIG_HOME", xdg.path())
+        .args(["append", "- x", "x.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success();
+    assert_eq!(
+        fs::read_to_string(nb.path().join("x.md")).expect("note reads"),
+        "---\ncreated: A\nupdated: A\n---\n- x\n"
+    );
+    write_config(xdg.path(), "stamp-format = 'B'\n");
+    kladde_state(state.path())
+        .env("XDG_CONFIG_HOME", xdg.path())
+        .args(["append", "- y", "x.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success();
+    assert_eq!(
+        fs::read_to_string(nb.path().join("x.md")).expect("note reads"),
+        "---\ncreated: A\nupdated: B\n---\n- x\n- y\n"
+    );
+}
+
+/// A block that predates kladde gains only the updated stamp: created
+/// records block creation, and kladde did not create this one.
+#[test]
+fn append_adds_updated_to_an_existing_block() {
+    let nb = temp();
+    let state = temp();
+    let xdg = temp();
+    write_config(xdg.path(), "stamp-format = 'X'\n");
+    fs::write(nb.path().join("x.md"), "---\nk: v\n---\nbody\n").expect("fixture writes");
+    kladde_state(state.path())
+        .env("XDG_CONFIG_HOME", xdg.path())
+        .args(["append", "- x", "x.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success();
+    assert_eq!(
+        fs::read_to_string(nb.path().join("x.md")).expect("note reads"),
+        "---\nk: v\nupdated: X\n---\nbody\n- x\n"
+    );
+}
+
+/// An exclude entry naming a linked folder excludes the notes that land
+/// in its target: notes are identified by their canonical path, so the
+/// entry is resolved the same way.
+#[test]
+fn stamping_excludes_through_notebook_links() {
+    let nb = temp();
+    let state = temp();
+    let xdg = temp();
+    fs::create_dir(nb.path().join("actual")).expect("fixture dir creates");
+    link_dir(&nb.path().join("templates"), &nb.path().join("actual"));
+    write_config(xdg.path(), "stamp-exclude = ['templates']\n");
+    kladde_state(state.path())
+        .env("XDG_CONFIG_HOME", xdg.path())
+        .args(["append", "- x", "templates/x.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success();
+    assert_eq!(
+        fs::read_to_string(nb.path().join("actual").join("x.md")).expect("note reads"),
+        "- x\n"
+    );
+}
+
+/// A `./` spelling names the same place after normalization, so it
+/// excludes what it says instead of silently matching nothing.
+#[test]
+fn stamping_normalizes_curdir_exclude_entries() {
+    let nb = temp();
+    let state = temp();
+    let xdg = temp();
+    kladde_in(xdg.path())
+        .args(["config", "set", "stamp-exclude", "./inbox"])
+        .assert()
+        .success();
+    kladde_in(xdg.path())
+        .env("XDG_STATE_HOME", state.path())
+        .args(["append", "- x", "inbox/x.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success();
+    assert_eq!(
+        fs::read_to_string(nb.path().join("inbox").join("x.md")).expect("note reads"),
+        "- x\n"
+    );
+}
+
+#[test]
+fn stamping_skips_excluded_paths() {
+    let nb = temp();
+    let state = temp();
+    let xdg = temp();
+    write_config(
+        xdg.path(),
+        "stamp-exclude = ['inbox', 'archive/2026', 'ghost']\n",
+    );
+    kladde_state(state.path())
+        .env("XDG_CONFIG_HOME", xdg.path())
+        .args(["append", "- x", "inbox/x.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success();
+    assert_eq!(
+        fs::read_to_string(nb.path().join("inbox").join("x.md")).expect("note reads"),
+        "- x\n"
+    );
+    kladde_state(state.path())
+        .env("XDG_CONFIG_HOME", xdg.path())
+        .args([
+            "frontmatter",
+            "set",
+            "k",
+            "v",
+            "archive/2026/y.md",
+            "--notebook",
+        ])
+        .arg(nb.path())
+        .assert()
+        .success();
+    assert_eq!(
+        fs::read_to_string(nb.path().join("archive").join("2026").join("y.md"))
+            .expect("note reads"),
+        "---\nk: v\n---\n"
+    );
+    kladde_state(state.path())
+        .env("XDG_CONFIG_HOME", xdg.path())
+        .args(["append", "- x", "elsewhere.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success();
+    let stamped = fs::read_to_string(nb.path().join("elsewhere.md")).expect("note reads");
+    assert!(stamped.starts_with("---\n"), "{stamped:?}");
+}
+
+/// A note whose stamp key is unusable still takes the append; the stamp
+/// is skipped whole rather than mangling the block.
+#[test]
+fn append_onto_a_misbehaving_stamp_key_succeeds_unstamped() {
+    let nb = temp();
+    let state = temp();
+    let cases = [
+        "---\nupdated: a\nupdated: b\n---\n",
+        "---\nupdated:\n  - a\n---\n",
+    ];
+    for block in cases {
+        fs::write(nb.path().join("x.md"), block).expect("fixture writes");
+        kladde_state(state.path())
+            .args(["append", "- x", "x.md", "--notebook"])
+            .arg(nb.path())
+            .assert()
+            .success();
+        let contents = fs::read_to_string(nb.path().join("x.md")).expect("note reads");
+        assert_eq!(contents, format!("{block}- x\n"), "for {block:?}");
+    }
+}
+
+/// Adding and removing list items are writes like any other: both
+/// stamp, which the format switch makes visible on the removal too.
+#[test]
+fn stamping_covers_list_edits() {
+    let nb = temp();
+    let state = temp();
+    let xdg = temp();
+    write_config(xdg.path(), "stamp-format = 'A'\n");
+    kladde_state(state.path())
+        .env("XDG_CONFIG_HOME", xdg.path())
+        .args(["frontmatter", "add", "tags", "a", "x.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success();
+    assert_eq!(
+        fs::read_to_string(nb.path().join("x.md")).expect("note reads"),
+        "---\ntags:\n  - a\ncreated: A\nupdated: A\n---\n"
+    );
+    write_config(xdg.path(), "stamp-format = 'B'\n");
+    kladde_state(state.path())
+        .env("XDG_CONFIG_HOME", xdg.path())
+        .args(["frontmatter", "remove", "tags", "a", "x.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success();
+    assert_eq!(
+        fs::read_to_string(nb.path().join("x.md")).expect("note reads"),
+        "---\ntags: []\ncreated: A\nupdated: B\n---\n"
+    );
+}
+
+/// Setting a property to the value it already holds writes nothing, so
+/// even the updated stamp stays put.
+#[test]
+fn frontmatter_set_of_the_same_value_bumps_nothing() {
+    let nb = temp();
+    let state = temp();
+    let text = "---\nk: v\ncreated: OLD\nupdated: OLD\n---\n";
+    fs::write(nb.path().join("x.md"), text).expect("fixture writes");
+    kladde_state(state.path())
+        .args(["frontmatter", "set", "k", "v", "x.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success();
+    assert_eq!(
+        fs::read_to_string(nb.path().join("x.md")).expect("note reads"),
+        text
+    );
+}
+
+/// Dropping the fences must never promote body text into frontmatter:
+/// an empty block stays behind, and the stamp lands in it, not in the
+/// planted chunk.
+#[test]
+fn frontmatter_unset_never_promotes_the_body() {
+    let nb = temp();
+    let state = temp();
+    let xdg = temp();
+    write_config(xdg.path(), "stamp-format = 'X'\n");
+    fs::write(
+        nb.path().join("x.md"),
+        "---\nk: v\n---\n---\nevil: y\n---\nbody\n",
+    )
+    .expect("fixture writes");
+    kladde_state(state.path())
+        .env("XDG_CONFIG_HOME", xdg.path())
+        .args(["frontmatter", "unset", "k", "x.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success();
+    assert_eq!(
+        fs::read_to_string(nb.path().join("x.md")).expect("note reads"),
+        "---\nupdated: X\n---\n---\nevil: y\n---\nbody\n"
+    );
+}
+
+/// A quoted spelling of a property is that property: an edit or a stamp
+/// replaces it in place instead of writing a duplicate key beside it.
+#[test]
+fn frontmatter_replaces_quoted_key_spellings() {
+    let nb = temp();
+    let state = temp();
+    let xdg = temp();
+    write_config(xdg.path(), "stamp-format = 'X'\n");
+    fs::write(
+        nb.path().join("q.md"),
+        "---\n\"updated\": old\nk: v\n---\nbody\n",
+    )
+    .expect("fixture writes");
+    kladde_state(state.path())
+        .env("XDG_CONFIG_HOME", xdg.path())
+        .args(["append", "- x", "q.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success();
+    assert_eq!(
+        fs::read_to_string(nb.path().join("q.md")).expect("note reads"),
+        "---\nupdated: X\nk: v\n---\nbody\n- x\n"
+    );
+    fs::write(nb.path().join("s.md"), "---\n\"status\": old\n---\n").expect("fixture writes");
+    kladde_unstamped(state.path(), xdg.path())
+        .args(["frontmatter", "set", "status", "new", "s.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success();
+    assert_eq!(
+        fs::read_to_string(nb.path().join("s.md")).expect("note reads"),
+        "---\nstatus: new\n---\n"
+    );
+    fs::write(
+        nb.path().join("d.md"),
+        "---\n\"status\": a\nstatus: b\n---\n",
+    )
+    .expect("fixture writes");
+    kladde()
+        .args(["frontmatter", "get", "status", "d.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .code(1)
+        .stderr(contains("multiple properties named \"status\""));
+    fs::write(nb.path().join("e.md"), "---\n\"up\\u0064ated\": old\n---\n")
+        .expect("fixture writes");
+    kladde_unstamped(state.path(), xdg.path())
+        .args(["frontmatter", "set", "updated", "new", "e.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success();
+    assert_eq!(
+        fs::read_to_string(nb.path().join("e.md")).expect("note reads"),
+        "---\nupdated: new\n---\n"
+    );
+    fs::write(nb.path().join("f.md"), "---\nupdated:\told\n---\nbody\n").expect("fixture writes");
+    write_config(xdg.path(), "stamp-format = 'X'\n");
+    kladde_state(state.path())
+        .env("XDG_CONFIG_HOME", xdg.path())
+        .args(["append", "- x", "f.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success();
+    assert_eq!(
+        fs::read_to_string(nb.path().join("f.md")).expect("note reads"),
+        "---\nupdated: X\n---\nbody\n- x\n"
+    );
+}
+
+/// An exclusion reaching through a link into a folder that does not
+/// exist yet still excludes the first write: the entry's deepest
+/// existing ancestor resolves like a note path, and the remainder rides
+/// along.
+#[test]
+fn stamping_excludes_linked_entries_with_missing_suffixes() {
+    let nb = temp();
+    let state = temp();
+    let xdg = temp();
+    fs::create_dir(nb.path().join("actual")).expect("fixture dir creates");
+    link_dir(&nb.path().join("alias"), &nb.path().join("actual"));
+    write_config(xdg.path(), "stamp-exclude = ['alias/new']\n");
+    kladde_state(state.path())
+        .env("XDG_CONFIG_HOME", xdg.path())
+        .args(["append", "- x", "alias/new/note.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success();
+    assert_eq!(
+        fs::read_to_string(nb.path().join("actual").join("new").join("note.md"))
+            .expect("note reads"),
+        "- x\n"
+    );
+}
+
+/// An exclusion matches case-folded spellings even before its folder
+/// exists, so the first write is excluded like every later one.
+#[test]
+fn stamping_excludes_case_aliased_paths_before_they_exist() {
+    let nb = temp();
+    let state = temp();
+    let xdg = temp();
+    write_config(xdg.path(), "stamp-exclude = ['Templates']\n");
+    kladde_state(state.path())
+        .env("XDG_CONFIG_HOME", xdg.path())
+        .args(["append", "- x", "templates/x.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success();
+    assert_eq!(
+        fs::read_to_string(nb.path().join("templates").join("x.md")).expect("note reads"),
+        "- x\n"
+    );
+}
+
+/// A misbehaving created key skips the whole stamp: the edit lands,
+/// nothing else changes.
+#[test]
+fn stamping_skips_wholly_when_the_created_key_misbehaves() {
+    let nb = temp();
+    let state = temp();
+    kladde_state(state.path())
+        .args([
+            "frontmatter",
+            "add",
+            "created",
+            "mine",
+            "x.md",
+            "--notebook",
+        ])
+        .arg(nb.path())
+        .assert()
+        .success();
+    assert_eq!(
+        fs::read_to_string(nb.path().join("x.md")).expect("note reads"),
+        "---\ncreated:\n  - mine\n---\n"
+    );
+}
+
+/// A created value the same edit writes by hand survives the stamp.
+#[test]
+fn stamping_preserves_a_manual_created_value() {
+    let nb = temp();
+    let state = temp();
+    let xdg = temp();
+    write_config(xdg.path(), "stamp-format = 'X'\n");
+    kladde_state(state.path())
+        .env("XDG_CONFIG_HOME", xdg.path())
+        .args([
+            "frontmatter",
+            "set",
+            "created",
+            "mine",
+            "x.md",
+            "--notebook",
+        ])
+        .arg(nb.path())
+        .assert()
+        .success();
+    assert_eq!(
+        fs::read_to_string(nb.path().join("x.md")).expect("note reads"),
+        "---\ncreated: mine\nupdated: X\n---\n"
+    );
+}
+
+/// Writes read the config for their stamp keys, so a broken config fails
+/// them even when `--notebook` pins the notebook.
+#[test]
+fn writes_report_a_broken_config_despite_a_path_target() {
+    let xdg = temp();
+    let nb = temp();
+    let state = temp();
+    write_config(xdg.path(), "not toml [\n");
+    kladde_in(xdg.path())
+        .env("XDG_STATE_HOME", state.path())
+        .args(["append", "- x", "x.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .code(1)
+        .stderr(contains("invalid TOML"));
+    kladde_in(xdg.path())
+        .env("XDG_STATE_HOME", state.path())
+        .args(["frontmatter", "set", "k", "v", "x.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .code(1)
+        .stderr(contains("invalid TOML"));
+    assert!(!nb.path().join("x.md").exists());
+}
+
+/// Windows spells the usage line `kladde.exe`, so the assertion anchors
+/// on the subcommand instead of the binary name.
+#[test]
+fn frontmatter_requires_a_subcommand() {
+    kladde()
+        .arg("frontmatter")
+        .assert()
+        .code(2)
+        .stderr(contains("frontmatter <COMMAND>"));
+}
+
+#[test]
+fn frontmatter_rejects_conflicting_targets() {
+    let nb = temp();
+    kladde()
+        .args([
+            "frontmatter",
+            "get",
+            "k",
+            "x.md",
+            "--name",
+            "y",
+            "--notebook",
+        ])
+        .arg(nb.path())
+        .assert()
+        .code(2)
+        .stderr(contains("cannot be used with"));
 }
 
 /// The stress test doubles as the create-if-missing race test: all
@@ -1700,8 +3333,22 @@ fn append_concurrent_writers_lose_nothing() {
         }
     });
     let contents = fs::read_to_string(nb.path().join("2026-01-05.md")).expect("note reads");
-    assert_eq!(contents.lines().count(), WRITERS * ENTRIES);
-    let lines: std::collections::HashSet<&str> = contents.lines().collect();
+    let body: Vec<&str> = contents
+        .lines()
+        .filter(|line| line.starts_with("- w"))
+        .collect();
+    assert_eq!(body.len(), WRITERS * ENTRIES);
+    let created = contents
+        .lines()
+        .filter(|line| line.starts_with("created: "))
+        .count();
+    assert_eq!(created, 1);
+    let updated = contents
+        .lines()
+        .filter(|line| line.starts_with("updated: "))
+        .count();
+    assert_eq!(updated, 1);
+    let lines: std::collections::HashSet<&str> = body.iter().copied().collect();
     for writer in 0..WRITERS {
         for entry in 0..ENTRIES {
             assert!(lines.contains(format!("- w{writer}e{entry}").as_str()));

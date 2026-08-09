@@ -7,5 +7,6 @@
 pub mod config;
 pub mod day;
 pub mod editor;
+pub mod frontmatter;
 pub mod notebook;
 pub mod write;

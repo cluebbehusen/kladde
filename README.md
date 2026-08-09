@@ -19,6 +19,18 @@ Because Kladde writes pure markdown files, it is compatible with any markdown
 editor. For example, Kladde can be used to write to your Obsidian vault simply
 by pointing Kladde at the vault folder.
 
+## Frontmatter
+
+Kladde reads and edits a note's frontmatter, the YAML properties block at the
+top of a note. `kladde frontmatter set`, `get`, `unset`, `add`, and `remove` can
+be used to interact with both text and list values in the frontmatter.
+
+By default, every write also stamps the note: a `created` property is added when
+Kladde creates a note's frontmatter block, and an `updated` property is
+refreshed on every change. The property names and timestamp format are
+configurable, folders can be excluded, and stamping can be turned off entirely;
+see [Configuration](#configuration).
+
 ## Configuration
 
 Kladde is configured through a single TOML file; see the

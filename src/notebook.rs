@@ -97,18 +97,21 @@ impl NotePath {
     }
 
     /// The canonical root of the notebook the note was resolved in.
-    pub(crate) fn root(&self) -> &Path {
+    #[must_use]
+    pub fn root(&self) -> &Path {
         &self.root
     }
 
-    /// The note's path relative to its notebook root.
+    /// The note's path relative to its notebook root, which is what
+    /// notebook-relative settings like `stamp-exclude` match against.
     ///
     /// # Panics
     ///
     /// Panics when the path does not start with the root, which
     /// construction rules out: a note always lies inside its notebook's
     /// root.
-    pub(crate) fn relative(&self) -> &Path {
+    #[must_use]
+    pub fn relative(&self) -> &Path {
         self.absolute
             .strip_prefix(&self.root)
             .expect("a note lies inside its notebook")
@@ -116,6 +119,12 @@ impl NotePath {
 }
 
 impl Notebook {
+    /// The notebook's canonical root, the identity its lock is keyed on.
+    #[must_use]
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
     /// Opens the notebook rooted at `root`, canonicalizing it (symlinks,
     /// case, relative paths resolved against the current directory).
     ///
@@ -350,9 +359,9 @@ mod tests {
     #[test]
     fn open_canonicalizes_the_root() {
         let root = temp();
-        let note = notebook(&root)
-            .note(Path::new("x.md"))
-            .expect("target resolves");
+        let opened = notebook(&root);
+        assert_eq!(opened.root(), canonical(&root));
+        let note = opened.note(Path::new("x.md")).expect("target resolves");
         assert_eq!(note.as_path(), canonical(&root).join("x.md"));
     }
 
