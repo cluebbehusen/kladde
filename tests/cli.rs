@@ -1676,6 +1676,945 @@ fn append_ignores_a_planted_temp_link() {
     assert_eq!(contents, "- x\n");
 }
 
+/// Runs `append` with stamping off against `x.md` holding `contents`,
+/// passing the placement `args`, and returns the assertion.
+fn append_into(
+    nb: &TempDir,
+    state: &TempDir,
+    xdg: &TempDir,
+    contents: &str,
+    entry: &str,
+    args: &[&str],
+) -> assert_cmd::assert::Assert {
+    fs::write(nb.path().join("x.md"), contents).expect("fixture writes");
+    let mut command = kladde_unstamped(state.path(), xdg.path());
+    command
+        .args(["append", entry, "x.md"])
+        .args(args)
+        .arg("--notebook")
+        .arg(nb.path());
+    command.assert()
+}
+
+fn x_contents(nb: &TempDir) -> String {
+    fs::read_to_string(nb.path().join("x.md")).expect("note reads")
+}
+
+#[test]
+fn append_under_lands_at_the_section_end() {
+    let nb = temp();
+    let state = temp();
+    let xdg = temp();
+    append_into(
+        &nb,
+        &state,
+        &xdg,
+        "# A\nalpha\n# B\nbeta\n",
+        "- e",
+        &["--under", "A"],
+    )
+    .success();
+    assert_eq!(x_contents(&nb), "# A\nalpha\n- e\n# B\nbeta\n");
+}
+
+#[test]
+fn append_under_descends_headings() {
+    let nb = temp();
+    let state = temp();
+    let xdg = temp();
+    append_into(
+        &nb,
+        &state,
+        &xdg,
+        "# A\n## kladde\nx\n## other\ny\n",
+        "- e",
+        &["--under", "A", "--under", "kladde"],
+    )
+    .success();
+    assert_eq!(x_contents(&nb), "# A\n## kladde\nx\n- e\n## other\ny\n");
+}
+
+#[test]
+fn append_under_reads_heading_shapes() {
+    let nb = temp();
+    let state = temp();
+    let xdg = temp();
+    let cases = [
+        ("Title\n=====\nx\n", "Tit", "Title\n=====\nx\n- e\n"),
+        ("## Foo ##\nx\n", "Foo", "## Foo ##\nx\n- e\n"),
+        ("#hash\n===\nx\n", "#hash", "#hash\n===\nx\n- e\n"),
+        (
+            "####### Foo\n===\nx\n",
+            "####### Foo",
+            "####### Foo\n===\nx\n- e\n",
+        ),
+        ("# C#\nx\n", "C#", "# C#\nx\n- e\n"),
+        ("  # A\nx\n# B\n", "A", "  # A\nx\n- e\n# B\n"),
+        ("# A\n# B\n", "A", "# A\n- e\n# B\n"),
+        ("# A\nx\n\n\n# B\n", "A", "# A\nx\n- e\n\n\n# B\n"),
+        ("# A\nbody", "A", "# A\nbody\n- e\n"),
+        (
+            "# A\n```rust\ncode\n```",
+            "A",
+            "# A\n```rust\ncode\n```\n- e\n",
+        ),
+        (
+            "# A\n<!DOCTYPE html>\n# B\n",
+            "A",
+            "# A\n<!DOCTYPE html>\n- e\n# B\n",
+        ),
+        (
+            "# A\n<pretend>\nraw\n\n# B\n",
+            "A",
+            "# A\n<pretend>\nraw\n\n- e\n# B\n",
+        ),
+        ("# A\n*em* text\n# B\n", "A", "# A\n*em* text\n- e\n# B\n"),
+        (
+            "# A\n<script>\na\n</script>\n\n# B\n",
+            "A",
+            "# A\n<script>\na\n</script>\n- e\n\n# B\n",
+        ),
+        (
+            "---\r\nk: v\r\n---\r\n# A",
+            "A",
+            "---\r\nk: v\r\n---\r\n# A\r\n- e\r\n",
+        ),
+    ];
+    for (contents, query, expected) in cases {
+        append_into(&nb, &state, &xdg, contents, "- e", &["--under", query]).success();
+        assert_eq!(x_contents(&nb), expected, "for {contents:?}");
+    }
+}
+
+#[test]
+fn append_under_bullet_uses_a_tab_by_default() {
+    let nb = temp();
+    let state = temp();
+    let xdg = temp();
+    append_into(
+        &nb,
+        &state,
+        &xdg,
+        "- parent\n- other\n",
+        "- e",
+        &["--under-bullet", "parent"],
+    )
+    .success();
+    assert_eq!(x_contents(&nb), "- parent\n\t- e\n- other\n");
+}
+
+#[test]
+fn append_under_bullet_copies_an_existing_child_indent() {
+    let nb = temp();
+    let state = temp();
+    let xdg = temp();
+    append_into(
+        &nb,
+        &state,
+        &xdg,
+        "- parent\n  - child\n",
+        "- e",
+        &["--under-bullet", "parent"],
+    )
+    .success();
+    assert_eq!(x_contents(&nb), "- parent\n  - child\n  - e\n");
+}
+
+#[test]
+fn append_under_bullet_honors_spaces_mode() {
+    let nb = temp();
+    let state = temp();
+    let xdg = temp();
+    write_config(xdg.path(), "stamp = false\nbullet-indent = 'spaces'\n");
+    fs::write(nb.path().join("x.md"), "1. a\n").expect("fixture writes");
+    kladde_state(state.path())
+        .env("XDG_CONFIG_HOME", xdg.path())
+        .args(["append", "- e", "x.md", "--under-bullet", "a", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success();
+    assert_eq!(x_contents(&nb), "1. a\n   - e\n");
+}
+
+#[test]
+fn append_under_bullet_descends_a_thread() {
+    let nb = temp();
+    let state = temp();
+    let xdg = temp();
+    append_into(
+        &nb,
+        &state,
+        &xdg,
+        "- a\n\t- b\n\t\t- c\n- d\n",
+        "- e",
+        &["--under-bullet", "a", "--under-bullet", "b"],
+    )
+    .success();
+    assert_eq!(x_contents(&nb), "- a\n\t- b\n\t\t- c\n\t\t- e\n- d\n");
+}
+
+#[test]
+fn append_under_bullet_reads_loose_and_unterminated_items() {
+    let nb = temp();
+    let state = temp();
+    let xdg = temp();
+    append_into(
+        &nb,
+        &state,
+        &xdg,
+        "- a\n\n- b\n",
+        "- e",
+        &["--under-bullet", "a"],
+    )
+    .success();
+    assert_eq!(x_contents(&nb), "- a\n\t- e\n\n- b\n");
+    append_into(&nb, &state, &xdg, "- a", "- e", &["--under-bullet", "a"]).success();
+    assert_eq!(x_contents(&nb), "- a\n\t- e\n");
+}
+
+/// The parser reads bare carriage returns inconsistently, so placed
+/// appends refuse such notes outright; a plain append still works, as
+/// it claims no structure. An entry's own bare CR is normalized before
+/// it ever reaches the note.
+#[test]
+fn append_under_refuses_bare_carriage_returns() {
+    let nb = temp();
+    let state = temp();
+    let xdg = temp();
+    let cases = [
+        ("# A\rbody\r", &["--under", "A"][..]),
+        ("- p\r  - c\r", &["--under-bullet", "p"][..]),
+        ("# A\r\nbody\r", &["--under", "A"][..]),
+    ];
+    for (contents, args) in cases {
+        append_into(&nb, &state, &xdg, contents, "- e", args)
+            .code(1)
+            .stderr(contains("bare carriage-return line endings"));
+        assert_eq!(x_contents(&nb), contents, "for {contents:?}");
+    }
+    append_into(&nb, &state, &xdg, "# A\rbody\r", "- e", &[]).success();
+    assert_eq!(x_contents(&nb), "# A\rbody\r\n- e\n");
+}
+
+/// A plain entry directly after a quotation would read as its lazy
+/// continuation, so the quote is terminated with a blank line first.
+#[test]
+fn append_under_stays_out_of_quotations() {
+    let nb = temp();
+    let state = temp();
+    let xdg = temp();
+    append_into(
+        &nb,
+        &state,
+        &xdg,
+        "# A\n> quoted\n# B\n",
+        "plain",
+        &["--under", "A"],
+    )
+    .success();
+    assert_eq!(x_contents(&nb), "# A\n> quoted\n\nplain\n# B\n");
+    append_into(
+        &nb,
+        &state,
+        &xdg,
+        "- p\n  > q\n- q2\n",
+        "- e",
+        &["--under-bullet", "p"],
+    )
+    .success();
+    assert_eq!(x_contents(&nb), "- p\n  > q\n\n\t- e\n- q2\n");
+    append_into(
+        &nb,
+        &state,
+        &xdg,
+        "# A\n> early\n\nlate\n# B\n",
+        "- e",
+        &["--under", "A"],
+    )
+    .success();
+    assert_eq!(x_contents(&nb), "# A\n> early\n\nlate\n- e\n# B\n");
+}
+
+/// A fence inside an item closes with an indent measured against the
+/// item's content column; cut off by the note's end, it still counts as
+/// closed and the entry follows it.
+#[test]
+fn append_under_bullet_follows_a_nested_closed_fence() {
+    let nb = temp();
+    let state = temp();
+    let xdg = temp();
+    append_into(
+        &nb,
+        &state,
+        &xdg,
+        "- p\n  ```\n  code\n  ```",
+        "- e",
+        &["--under-bullet", "p"],
+    )
+    .success();
+    assert_eq!(x_contents(&nb), "- p\n  ```\n  code\n  ```\n\t- e\n");
+}
+
+#[test]
+fn append_under_heading_and_bullet_together() {
+    let nb = temp();
+    let state = temp();
+    let xdg = temp();
+    append_into(
+        &nb,
+        &state,
+        &xdg,
+        "# A\n- todo\n# B\n- todo\n",
+        "- e",
+        &["--under", "B", "--under-bullet", "todo"],
+    )
+    .success();
+    assert_eq!(x_contents(&nb), "# A\n- todo\n# B\n- todo\n\t- e\n");
+}
+
+#[test]
+fn append_under_indents_every_entry_line() {
+    let nb = temp();
+    let state = temp();
+    let xdg = temp();
+    append_into(
+        &nb,
+        &state,
+        &xdg,
+        "- a\n",
+        "- e\n\nmore\r\nlast\rtail",
+        &["--under-bullet", "a"],
+    )
+    .success();
+    assert_eq!(x_contents(&nb), "- a\n\t- e\n\n\tmore\n\tlast\n\ttail\n");
+}
+
+#[test]
+fn append_under_keeps_a_crlf_note_crlf() {
+    let nb = temp();
+    let state = temp();
+    let xdg = temp();
+    append_into(
+        &nb,
+        &state,
+        &xdg,
+        "# A\r\nx\r\n# B\r\n",
+        "- e",
+        &["--under", "A"],
+    )
+    .success();
+    assert_eq!(x_contents(&nb), "# A\r\nx\r\n- e\r\n# B\r\n");
+}
+
+/// Pseudo-structure never matches: fenced and indented code are content,
+/// quoted structure is not kladde's to extend, and a heading indented
+/// into a list item is item content, not a section boundary.
+#[test]
+fn append_under_ignores_disguised_structure() {
+    let nb = temp();
+    let state = temp();
+    let xdg = temp();
+    // The paragraph before the indented code matters: four-space
+    // content directly after a list item is item continuation, not code.
+    let contents =
+        "# A\n```\n# fake\n- fake\n```\n> # H\n> - q\n- item\n  # inner\n\npara\n\n    - code\n";
+    let cases = [
+        (&["--under", "fake"][..], "no heading matching \"fake\""),
+        (
+            &["--under-bullet", "fake"][..],
+            "no bullet matching \"fake\"",
+        ),
+        (&["--under", "H"][..], "no heading matching \"H\""),
+        (&["--under-bullet", "q"][..], "no bullet matching \"q\""),
+        (&["--under", "inner"][..], "no heading matching \"inner\""),
+        (
+            &["--under-bullet", "code"][..],
+            "no bullet matching \"code\"",
+        ),
+    ];
+    for (args, fragment) in cases {
+        append_into(&nb, &state, &xdg, contents, "- e", args)
+            .code(1)
+            .stderr(contains(fragment));
+        assert_eq!(x_contents(&nb), contents, "for {args:?}");
+    }
+}
+
+#[test]
+fn append_under_reports_unmatched_and_invalid_targets() {
+    let nb = temp();
+    let state = temp();
+    let xdg = temp();
+    let cases = [
+        (
+            "# Alpha\n# Alp\n",
+            &["--under", "Alp"][..],
+            "multiple headings matching \"Alp\"",
+        ),
+        (
+            "- x\n\t- xy\n",
+            &["--under-bullet", "x"][..],
+            "multiple bullets matching \"x\"",
+        ),
+        ("#\nx\n", &["--under", "x"][..], "no heading matching \"x\""),
+        (
+            "# #\nx\n",
+            &["--under", "#"][..],
+            "no heading matching \"#\"",
+        ),
+        (
+            "# A\n",
+            &["--under", ""][..],
+            "invalid heading \"\": it is empty",
+        ),
+        (
+            "# A\n",
+            &["--under-bullet", ""][..],
+            "invalid bullet \"\": it is empty",
+        ),
+        (
+            "# A\n",
+            &["--under", "a\nb"][..],
+            "invalid heading \"a\\nb\": it contains a line break",
+        ),
+        (
+            "# A\n",
+            &["--under-bullet", "a\rb"][..],
+            "invalid bullet \"a\\rb\": it contains a line break",
+        ),
+        (
+            "-\n  ```\n  code\n",
+            &["--under-bullet", "x"][..],
+            "no bullet matching \"x\"",
+        ),
+    ];
+    for (contents, args, fragment) in cases {
+        append_into(&nb, &state, &xdg, contents, "- e", args)
+            .code(1)
+            .stderr(contains(fragment));
+        assert_eq!(x_contents(&nb), contents, "for {args:?}");
+    }
+}
+
+/// A placement can never match in a missing note, so the append fails
+/// rather than create a note holding only the entry.
+#[test]
+fn append_under_missing_note_creates_nothing() {
+    let nb = temp();
+    let state = temp();
+    let xdg = temp();
+    kladde_unstamped(state.path(), xdg.path())
+        .args(["append", "- e", "missing.md", "--under", "A", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .code(1)
+        .stderr(contains("no heading matching \"A\""));
+    assert!(!nb.path().join("missing.md").exists());
+}
+
+#[test]
+fn append_under_skips_frontmatter() {
+    let nb = temp();
+    let state = temp();
+    let xdg = temp();
+    let contents = "---\ntitle: x\n---\n# A\nbody\n";
+    append_into(&nb, &state, &xdg, contents, "- e", &["--under", "title"])
+        .code(1)
+        .stderr(contains("no heading matching \"title\""));
+    append_into(&nb, &state, &xdg, contents, "- e", &["--under", "A"]).success();
+    assert_eq!(x_contents(&nb), "---\ntitle: x\n---\n# A\nbody\n- e\n");
+}
+
+#[test]
+fn append_under_stamps_the_placed_write() {
+    let nb = temp();
+    let state = temp();
+    let xdg = temp();
+    write_config(xdg.path(), "stamp-format = 'X'\n");
+    fs::write(nb.path().join("x.md"), "# A\nx\n").expect("fixture writes");
+    kladde_state(state.path())
+        .env("XDG_CONFIG_HOME", xdg.path())
+        .args(["append", "- e", "x.md", "--under", "A", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success();
+    assert_eq!(
+        x_contents(&nb),
+        "---\ncreated: X\nupdated: X\n---\n# A\nx\n- e\n"
+    );
+}
+
+/// A closing `#` run is heading syntax, not text, so `Foo #` names only
+/// the heading whose text really continues past the hash.
+#[test]
+fn append_under_disambiguates_closing_hashes() {
+    let nb = temp();
+    let state = temp();
+    let xdg = temp();
+    append_into(
+        &nb,
+        &state,
+        &xdg,
+        "# Foo #\nx\n# Foo # bar\ny\n",
+        "- e",
+        &["--under", "Foo #"],
+    )
+    .success();
+    assert_eq!(x_contents(&nb), "# Foo #\nx\n# Foo # bar\ny\n- e\n");
+}
+
+/// The entry must reach the parent's content column or markdown does
+/// not nest it; descending through the new child immediately proves the
+/// written structure is real.
+#[test]
+fn append_under_tab_reaches_the_content_column() {
+    let nb = temp();
+    let state = temp();
+    let xdg = temp();
+    append_into(
+        &nb,
+        &state,
+        &xdg,
+        "100. p\n",
+        "- e",
+        &["--under-bullet", "p"],
+    )
+    .success();
+    assert_eq!(x_contents(&nb), "100. p\n\t\t- e\n");
+    kladde_unstamped(state.path(), xdg.path())
+        .args([
+            "append",
+            "- x",
+            "x.md",
+            "--under-bullet",
+            "p",
+            "--under-bullet",
+            "e",
+            "--notebook",
+        ])
+        .arg(nb.path())
+        .assert()
+        .success();
+    assert_eq!(x_contents(&nb), "100. p\n\t\t- e\n\t\t\t- x\n");
+}
+
+/// An entry near raw HTML lands after the blank that terminates the
+/// block, never inside it; HTML cut off by the end of the note gets its
+/// terminating blank written, and a self-closed block needs neither.
+#[test]
+fn append_under_respects_raw_html() {
+    let nb = temp();
+    let state = temp();
+    let xdg = temp();
+    append_into(
+        &nb,
+        &state,
+        &xdg,
+        "# A\n<div>\nraw\n\n# B\n",
+        "- e",
+        &["--under", "A"],
+    )
+    .success();
+    assert_eq!(x_contents(&nb), "# A\n<div>\nraw\n\n- e\n# B\n");
+    kladde_unstamped(state.path(), xdg.path())
+        .args([
+            "append",
+            "- x",
+            "x.md",
+            "--under",
+            "A",
+            "--under-bullet",
+            "e",
+            "--notebook",
+        ])
+        .arg(nb.path())
+        .assert()
+        .success();
+    assert_eq!(x_contents(&nb), "# A\n<div>\nraw\n\n- e\n\t- x\n# B\n");
+    append_into(
+        &nb,
+        &state,
+        &xdg,
+        "# A\n<div>\nraw",
+        "- e",
+        &["--under", "A"],
+    )
+    .success();
+    assert_eq!(x_contents(&nb), "# A\n<div>\nraw\n\n- e\n");
+    append_into(
+        &nb,
+        &state,
+        &xdg,
+        "# A\n<script>\na\n</script>\n# B\n",
+        "- e",
+        &["--under", "A"],
+    )
+    .success();
+    assert_eq!(x_contents(&nb), "# A\n<script>\na\n</script>\n- e\n# B\n");
+}
+
+/// An entry can never be smuggled into code or raw HTML: an unclosed
+/// fence or marker-terminated HTML block refuses the placement outright.
+#[test]
+fn append_under_rejects_unclosed_code_and_html() {
+    let nb = temp();
+    let state = temp();
+    let xdg = temp();
+    let fence = "unclosed code fence";
+    let html = "unclosed raw HTML";
+    let cases = [
+        ("# A\n~~~\ncode\n", &["--under", "A"][..], fence),
+        ("# A\n```\n", &["--under", "A"][..], fence),
+        ("# A\n````\ncode\n```\n", &["--under", "A"][..], fence),
+        ("# A\n~~~\ncode\n    ~~~\n", &["--under", "A"][..], fence),
+        ("# A\n```\ncode\n```\t\n", &["--under", "A"][..], fence),
+        ("- p\n  ```\n  code\n", &["--under-bullet", "p"][..], fence),
+        (
+            "- p\n  ```\n  code\n      ```\n",
+            &["--under-bullet", "p"][..],
+            fence,
+        ),
+        ("# A\n<script>\nraw\n", &["--under", "A"][..], html),
+        (
+            "# A\n<script>\nraw\n</style>\npara\n",
+            &["--under", "A"][..],
+            html,
+        ),
+        ("# A\n<script\u{c}>\nraw\n", &["--under", "A"][..], html),
+        ("# A\n<script>\né", &["--under", "A"][..], html),
+        ("# A\n<!-- note\n", &["--under", "A"][..], html),
+        ("# A\n<?process\n", &["--under", "A"][..], html),
+        ("# A\n<![CDATA[\n", &["--under", "A"][..], html),
+        (
+            "- p\n  <script>\n  raw\n- q\n",
+            &["--under-bullet", "p"][..],
+            html,
+        ),
+    ];
+    for (contents, args, fragment) in cases {
+        append_into(&nb, &state, &xdg, contents, "- e", args)
+            .code(1)
+            .stderr(contains(fragment));
+        assert_eq!(x_contents(&nb), contents, "for {contents:?}");
+    }
+}
+
+/// A blank-terminated HTML block cut off by a sibling item gets its
+/// terminating blank written, so the entry stays out of the HTML and
+/// can be descended through.
+#[test]
+fn append_under_closes_html_cut_by_a_sibling() {
+    let nb = temp();
+    let state = temp();
+    let xdg = temp();
+    append_into(
+        &nb,
+        &state,
+        &xdg,
+        "- p\n  <div>\n  raw\n- q\n",
+        "- e",
+        &["--under-bullet", "p"],
+    )
+    .success();
+    assert_eq!(x_contents(&nb), "- p\n  <div>\n  raw\n\n\t- e\n- q\n");
+    kladde_unstamped(state.path(), xdg.path())
+        .args([
+            "append",
+            "- x",
+            "x.md",
+            "--under-bullet",
+            "p",
+            "--under-bullet",
+            "e",
+            "--notebook",
+        ])
+        .arg(nb.path())
+        .assert()
+        .success();
+    assert_eq!(
+        x_contents(&nb),
+        "- p\n  <div>\n  raw\n\n\t- e\n\t\t- x\n- q\n"
+    );
+}
+
+/// Five or more spaces after a marker are one space of padding plus
+/// indented code, so the content column snaps back to the marker and
+/// the child still nests.
+#[test]
+fn append_under_respects_list_padding() {
+    let nb = temp();
+    let state = temp();
+    let xdg = temp();
+    append_into(
+        &nb,
+        &state,
+        &xdg,
+        "-     p\n",
+        "- e",
+        &["--under-bullet", "p"],
+    )
+    .success();
+    assert_eq!(x_contents(&nb), "-     p\n\t- e\n");
+    kladde_unstamped(state.path(), xdg.path())
+        .args([
+            "append",
+            "- x",
+            "x.md",
+            "--under-bullet",
+            "p",
+            "--under-bullet",
+            "e",
+            "--notebook",
+        ])
+        .arg(nb.path())
+        .assert()
+        .success();
+    assert_eq!(x_contents(&nb), "-     p\n\t- e\n\t\t- x\n");
+}
+
+/// The splice must leave surrounding structure meaning what it meant:
+/// a blank line restores the boundary where one can, and the placement
+/// is refused where none can.
+#[test]
+fn append_under_preserves_surrounding_structure() {
+    let nb = temp();
+    let state = temp();
+    let xdg = temp();
+    append_into(
+        &nb,
+        &state,
+        &xdg,
+        "# A\n```\nc\n```\nB\n===\ny\n",
+        "- e",
+        &["--under", "A"],
+    )
+    .success();
+    assert_eq!(x_contents(&nb), "# A\n```\nc\n```\n- e\n\nB\n===\ny\n");
+    kladde_unstamped(state.path(), xdg.path())
+        .args(["append", "- x", "x.md", "--under", "B", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success();
+    append_into(
+        &nb,
+        &state,
+        &xdg,
+        "# A\n- item\n# B\n",
+        "plain",
+        &["--under", "A"],
+    )
+    .success();
+    assert_eq!(x_contents(&nb), "# A\n- item\n\nplain\n# B\n");
+    append_into(
+        &nb,
+        &state,
+        &xdg,
+        "- p\n  > q\n\npara\n",
+        "- e",
+        &["--under-bullet", "p"],
+    )
+    .success();
+    assert_eq!(x_contents(&nb), "- p\n  > q\n\n\t- e\n\npara\n");
+    let indented = "# A\np\n  # B\ny\n";
+    append_into(&nb, &state, &xdg, indented, "- e", &["--under", "A"])
+        .code(1)
+        .stderr(contains("the entry would change the structure around it"));
+    assert_eq!(x_contents(&nb), indented);
+}
+
+/// An entry carrying a heading must not reparent the sections after it,
+/// and one that would complete a half-open frontmatter fence is refused
+/// before the boundary can move.
+#[test]
+fn append_under_guards_surrounding_meaning() {
+    let nb = temp();
+    let state = temp();
+    let xdg = temp();
+    let reparenting = "# A\n## B\nx\n## C\ny\n";
+    append_into(
+        &nb,
+        &state,
+        &xdg,
+        reparenting,
+        "# New",
+        &["--under", "A", "--under", "B"],
+    )
+    .code(1)
+    .stderr(contains("the entry would change the structure around it"));
+    assert_eq!(x_contents(&nb), reparenting);
+    append_into(
+        &nb,
+        &state,
+        &xdg,
+        reparenting,
+        "### deep",
+        &["--under", "A", "--under", "B"],
+    )
+    .success();
+    assert_eq!(x_contents(&nb), "# A\n## B\nx\n### deep\n## C\ny\n");
+    let half_open = "---\n# A\nx\n";
+    append_into(&nb, &state, &xdg, half_open, "---", &["--under", "A"])
+        .code(1)
+        .stderr(contains("the entry would change the structure around it"));
+    assert_eq!(x_contents(&nb), half_open);
+}
+
+/// Plain text under a parent with children becomes the parent's own
+/// paragraph, and a multiline entry owns its block at its first line.
+#[test]
+fn append_under_anchors_entries_to_their_own_blocks() {
+    let nb = temp();
+    let state = temp();
+    let xdg = temp();
+    append_into(
+        &nb,
+        &state,
+        &xdg,
+        "- parent\n  - child\n",
+        "plain",
+        &["--under-bullet", "parent"],
+    )
+    .success();
+    assert_eq!(x_contents(&nb), "- parent\n  - child\n\n  plain\n");
+    append_into(
+        &nb,
+        &state,
+        &xdg,
+        "# A\n- item\n# B\n",
+        "new\n- later",
+        &["--under", "A"],
+    )
+    .success();
+    assert_eq!(x_contents(&nb), "# A\n- item\n\nnew\n- later\n# B\n");
+    append_into(&nb, &state, &xdg, "# A\nx\n# B\n", "---", &["--under", "A"]).success();
+    assert_eq!(x_contents(&nb), "# A\nx\n\n---\n# B\n");
+    append_into(
+        &nb,
+        &state,
+        &xdg,
+        "# A\nx\n",
+        "[ref]: /url",
+        &["--under", "A"],
+    )
+    .success();
+    assert_eq!(x_contents(&nb), "# A\nx\n\n[ref]: /url\n");
+}
+
+#[test]
+fn append_under_copies_the_last_direct_childs_indent() {
+    let nb = temp();
+    let state = temp();
+    let xdg = temp();
+    append_into(
+        &nb,
+        &state,
+        &xdg,
+        "- p\n    - deep\n  - shallow\n",
+        "- e",
+        &["--under-bullet", "p"],
+    )
+    .success();
+    assert_eq!(x_contents(&nb), "- p\n    - deep\n  - shallow\n  - e\n");
+}
+
+/// A sublist can open on its parent's marker line: the indent written
+/// beside it is column-equivalent whitespace, never a copied marker,
+/// and a descent chain can reach it.
+#[test]
+fn append_under_reaches_marker_line_children() {
+    let nb = temp();
+    let state = temp();
+    let xdg = temp();
+    append_into(
+        &nb,
+        &state,
+        &xdg,
+        "- - beta\n",
+        "- e",
+        &["--under-bullet", "- beta"],
+    )
+    .success();
+    assert_eq!(x_contents(&nb), "- - beta\n  - e\n");
+    append_into(
+        &nb,
+        &state,
+        &xdg,
+        "- - beta\n",
+        "- e",
+        &["--under-bullet", "- beta", "--under-bullet", "beta"],
+    )
+    .success();
+    assert_eq!(x_contents(&nb), "- - beta\n\t- e\n");
+}
+
+/// An entry indented below an unclosed block's container ends the
+/// container and the block with it; the placement is safe and the new
+/// entry is immediately addressable.
+#[test]
+fn append_under_deindents_past_contained_blocks() {
+    let nb = temp();
+    let state = temp();
+    let xdg = temp();
+    append_into(
+        &nb,
+        &state,
+        &xdg,
+        "- p\n  - c\n    ```\n    code\n",
+        "- e",
+        &["--under-bullet", "p"],
+    )
+    .success();
+    assert_eq!(x_contents(&nb), "- p\n  - c\n    ```\n    code\n  - e\n");
+    kladde_unstamped(state.path(), xdg.path())
+        .args([
+            "append",
+            "- x",
+            "x.md",
+            "--under-bullet",
+            "p",
+            "--under-bullet",
+            "e",
+            "--notebook",
+        ])
+        .arg(nb.path())
+        .assert()
+        .success();
+    assert_eq!(
+        x_contents(&nb),
+        "- p\n  - c\n    ```\n    code\n  - e\n  \t- x\n"
+    );
+    append_into(
+        &nb,
+        &state,
+        &xdg,
+        "- p\n  - c\n    <script>\n    raw\n",
+        "- e",
+        &["--under-bullet", "p"],
+    )
+    .success();
+    assert_eq!(
+        x_contents(&nb),
+        "- p\n  - c\n    <script>\n    raw\n  - e\n"
+    );
+}
+
+#[test]
+fn append_under_accepts_hyphen_targets() {
+    let nb = temp();
+    let state = temp();
+    let xdg = temp();
+    append_into(
+        &nb,
+        &state,
+        &xdg,
+        "# -Head\n- -dash\n",
+        "- e",
+        &["--under", "-Head", "--under-bullet", "-dash"],
+    )
+    .success();
+    assert_eq!(x_contents(&nb), "# -Head\n- -dash\n\t- e\n");
+}
+
 /// `path` reports where a note would live without creating it; only
 /// `append` creates.
 #[test]
@@ -2794,6 +3733,62 @@ fn config_load_rejects_bad_stamp_values() {
         write_config(xdg.path(), contents);
         kladde_in(xdg.path())
             .args(["config", "get", "stamp"])
+            .assert()
+            .code(1)
+            .stderr(contains(fragment));
+    }
+}
+
+#[test]
+fn config_bullet_indent_round_trips() {
+    let xdg = temp();
+    kladde_in(xdg.path())
+        .args(["config", "get", "bullet-indent"])
+        .assert()
+        .code(1)
+        .stdout("");
+    for value in ["tab", "spaces"] {
+        kladde_in(xdg.path())
+            .args(["config", "set", "bullet-indent", value])
+            .assert()
+            .success();
+        kladde_in(xdg.path())
+            .args(["config", "get", "bullet-indent"])
+            .assert()
+            .success()
+            .stdout(format!("{value}\n"));
+    }
+    kladde_in(xdg.path())
+        .args(["config", "unset", "bullet-indent"])
+        .assert()
+        .success();
+    kladde_in(xdg.path())
+        .args(["config", "get", "bullet-indent"])
+        .assert()
+        .code(1)
+        .stdout("");
+}
+
+#[test]
+fn config_rejects_a_bad_bullet_indent() {
+    let xdg = temp();
+    kladde_in(xdg.path())
+        .args(["config", "set", "bullet-indent", "wide"])
+        .assert()
+        .code(1)
+        .stderr(contains("`bullet-indent` must be \"tab\" or \"spaces\""));
+    assert!(!config_file(xdg.path()).exists());
+    let cases = [
+        ("bullet-indent = 1\n", "`bullet-indent` must be a string"),
+        (
+            "bullet-indent = 'wide'\n",
+            "`bullet-indent` must be \"tab\" or \"spaces\"",
+        ),
+    ];
+    for (contents, fragment) in cases {
+        write_config(xdg.path(), contents);
+        kladde_in(xdg.path())
+            .args(["config", "get", "bullet-indent"])
             .assert()
             .code(1)
             .stderr(contains(fragment));

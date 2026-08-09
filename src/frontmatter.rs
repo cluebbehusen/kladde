@@ -454,6 +454,16 @@ fn new_block() -> Block {
     }
 }
 
+/// The byte offset where a note's body begins: past the frontmatter
+/// block when the note has one, past a lone byte order mark otherwise,
+/// zero for everything else. The structure module slices here before
+/// reading markdown, so frontmatter is never mistaken for structure: a
+/// `key: value` line above a closing `---` fence would otherwise read as
+/// a setext heading.
+pub(crate) fn body_start(text: &str) -> usize {
+    text.len() - parse(text).body.len()
+}
+
 /// Splits a note at the frontmatter boundary. Never fails: a note whose
 /// head is not a well-formed block is all body.
 fn parse(text: &str) -> Document {
@@ -1989,6 +1999,22 @@ mod tests {
     fn has_block_detects_a_block() {
         assert!(has_block("---\n---\n"));
         assert!(!has_block("body\n"));
+    }
+
+    #[test]
+    fn body_start_lands_past_the_block() {
+        let cases = [
+            ("body\n", 0),
+            ("\u{feff}body\n", 3),
+            ("---\nk: v\n---\nbody\n", 13),
+            ("\u{feff}---\nk: v\n---\nbody\n", 16),
+            ("---\r\nk: v\r\n---\r\nbody\r\n", 16),
+            ("---\nk: v\n", 0),
+            ("---\n---\n", 8),
+        ];
+        for (text, start) in cases {
+            assert_eq!(body_start(text), start, "for {text:?}");
+        }
     }
 
     #[test]
