@@ -1164,15 +1164,17 @@ fn print_contents(contents: &str) {
 /// leaves the buffer. A broken pipe means the reader stopped listening —
 /// `kladde read note.md | head` — which is the reader's call: the
 /// process ends quietly as a success. Any other stdout failure has no
-/// better report channel than the panic.
+/// better report channel than the panic. The handling is spelled on
+/// always-run lines because only Unix produces the broken pipe under
+/// test: a Windows probe's write succeeds even with the pipe's read end
+/// closed.
 fn write_stdout(bytes: &[u8]) {
     use std::io::Write;
     let mut stdout = std::io::stdout();
-    if let Err(error) = stdout.write_all(bytes).and_then(|()| stdout.flush()) {
-        let broken = error.kind() == std::io::ErrorKind::BrokenPipe;
-        assert!(broken, "stdout writes: {error}");
-        std::process::exit(0);
-    }
+    let result = stdout.write_all(bytes).and_then(|()| stdout.flush());
+    let broken = matches!(&result, Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe);
+    let _ = broken.then(|| std::process::exit(0));
+    result.expect("stdout writes");
 }
 
 fn fail(message: impl Display) -> ExitCode {
