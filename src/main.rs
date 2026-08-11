@@ -496,7 +496,13 @@ fn list(flag: Option<PathBuf>) -> ExitCode {
 /// than a failed one.
 fn listed(flag: Option<PathBuf>) -> Result<(kladde::notebook::Notebook, Vec<PathBuf>), String> {
     let notebook = opened(flag)?;
-    let notes = notebook.notes().map_err(|error| error.to_string())?;
+    // Stringified eagerly, through a fn reference rather than a closure:
+    // only Unix can make the walk fail under test, and a closure that
+    // never runs on Windows is a function its coverage counts as missed.
+    let outcome = notebook.notes();
+    let message = outcome.as_ref().err().map(ToString::to_string);
+    let message = message.unwrap_or_default();
+    let notes = outcome.ok().ok_or(message)?;
     for note in &notes {
         printable(note)?;
     }
@@ -1164,16 +1170,27 @@ fn print_contents(contents: &str) {
 /// leaves the buffer. A broken pipe means the reader stopped listening —
 /// `kladde read note.md | head` — which is the reader's call: the
 /// process ends quietly as a success. Any other stdout failure has no
-/// better report channel than the panic. The handling is spelled on
-/// always-run lines because only Unix produces the broken pipe under
-/// test: a Windows probe's write succeeds even with the pipe's read end
-/// closed.
+/// better report channel than the panic.
+#[cfg(unix)]
 fn write_stdout(bytes: &[u8]) {
     use std::io::Write;
     let mut stdout = std::io::stdout();
     let result = stdout.write_all(bytes).and_then(|()| stdout.flush());
     let broken = matches!(&result, Err(error) if error.kind() == std::io::ErrorKind::BrokenPipe);
-    let _ = broken.then(|| std::process::exit(0));
+    if broken {
+        std::process::exit(0);
+    }
+    result.expect("stdout writes");
+}
+
+/// The Windows twin keeps the plain panic: a probe there cannot even
+/// observe a broken pipe — a write with the pipe's read end closed
+/// succeeds — so a quiet-exit path would be untestable dead code.
+#[cfg(windows)]
+fn write_stdout(bytes: &[u8]) {
+    use std::io::Write;
+    let mut stdout = std::io::stdout();
+    let result = stdout.write_all(bytes).and_then(|()| stdout.flush());
     result.expect("stdout writes");
 }
 

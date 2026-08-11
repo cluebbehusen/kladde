@@ -1053,8 +1053,10 @@ fn read_reports_an_unreadable_note() {
 /// A reader that stops early — the `| head` shape — closes the pipe
 /// while the note is still going through it; the broken pipe is the
 /// reader's call, so the process ends quietly as a success. The note is
-/// larger than any platform's pipe buffer, so the write is mid-stream
-/// when the reader disappears.
+/// larger than the pipe buffer, so the write is mid-stream when the
+/// reader disappears. Unix only: a Windows write succeeds even with the
+/// pipe's read end closed, so the scenario cannot be produced there.
+#[cfg(unix)]
 #[test]
 fn read_exits_cleanly_when_the_reader_stops_early() {
     let nb = temp();
