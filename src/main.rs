@@ -8,8 +8,9 @@ use unicase::UniCase;
 
 /// CLI for a local markdown notebook.
 ///
-/// Every command targets one note. With no target option that note is today's
-/// daily note, created from the daily template if it does not exist yet.
+/// Commands that take a target work on one note; with no target, that note is
+/// today's daily note. A write that creates a daily note seeds it from the
+/// daily template when one is configured.
 #[derive(Parser)]
 #[command(name = "kladde", version, arg_required_else_help = true)]
 struct Cli {
@@ -30,6 +31,64 @@ enum Command {
     Path {
         #[command(flatten)]
         target: TargetArgs,
+        #[command(flatten)]
+        notebook: NotebookArg,
+    },
+    /// Print a note's contents.
+    ///
+    /// The contents print exactly as stored. A missing note is an error,
+    /// so a missing note and an empty one can be told apart. With no
+    /// target, the note is today's daily note.
+    Read {
+        #[command(flatten)]
+        target: TargetArgs,
+        #[command(flatten)]
+        notebook: NotebookArg,
+    },
+    /// List every note in the notebook.
+    ///
+    /// Prints notebook-relative paths, one per line, sorted. Folders and
+    /// files whose names start with a dot are skipped, and links are
+    /// neither followed nor listed.
+    List {
+        #[command(flatten)]
+        notebook: NotebookArg,
+    },
+    /// Find notes by searching their contents.
+    ///
+    /// The match is case-insensitive; matching notes print as
+    /// notebook-relative paths, one per line, sorted. Exits with status 1
+    /// and no output when nothing matches.
+    Search {
+        /// Text to find. Text spelled exactly like an option of this
+        /// command needs a `--` separator first.
+        #[arg(allow_hyphen_values = true)]
+        query: String,
+        #[command(flatten)]
+        notebook: NotebookArg,
+    },
+    /// Open a note in an editor.
+    ///
+    /// The editor is the `editor` config key if set, otherwise the VISUAL
+    /// or EDITOR environment variable; a value naming no program counts
+    /// as unset. The note does not need to exist: nothing is created, and
+    /// the editor decides what a missing file means. With no target, the
+    /// note is today's daily note.
+    Open {
+        #[command(flatten)]
+        target: TargetArgs,
+        #[command(flatten)]
+        notebook: NotebookArg,
+    },
+    /// Create a note.
+    ///
+    /// The note is created empty, parent folders included; a daily note
+    /// starts from the daily template when one is configured. A note
+    /// that already exists is left untouched, which is success. With no
+    /// target, the note is today's daily note.
+    New {
+        #[command(flatten)]
+        target: NewTargetArgs,
         #[command(flatten)]
         notebook: NotebookArg,
     },
@@ -171,6 +230,29 @@ struct TargetArgs {
     date: Option<String>,
 }
 
+/// The note `new` creates. The two forms are mutually exclusive; a name
+/// lookup means an existing note, so `new` takes none. None of them
+/// means today's daily note.
+#[derive(Args)]
+#[group(multiple = false)]
+struct NewTargetArgs {
+    /// The note, as a relative path inside the notebook.
+    target: Option<PathBuf>,
+    /// A daily note: today, yesterday, tomorrow, or YYYY-MM-DD.
+    #[arg(long, value_name = "WHEN")]
+    date: Option<String>,
+}
+
+impl From<NewTargetArgs> for TargetArgs {
+    fn from(target: NewTargetArgs) -> Self {
+        Self {
+            target: target.target,
+            name: None,
+            date: target.date,
+        }
+    }
+}
+
 /// The notebook selection shared by every command that reads or writes notes.
 #[derive(Args)]
 struct NotebookArg {
@@ -219,6 +301,8 @@ enum ConfigKey {
     DailyFolder,
     /// Date format for daily note file names, for example `%Y-%m-%d`.
     DailyDateFormat,
+    /// Notebook-relative path of the note that seeds a new daily note.
+    DailyTemplate,
     /// Whether writes stamp created/updated properties: true or false.
     Stamp,
     /// Property name for the created stamp.
@@ -241,6 +325,7 @@ impl ConfigKey {
             Self::Editor => kladde::config::EDITOR,
             Self::DailyFolder => kladde::config::DAILY_FOLDER,
             Self::DailyDateFormat => kladde::config::DAILY_DATE_FORMAT,
+            Self::DailyTemplate => kladde::config::DAILY_TEMPLATE,
             Self::Stamp => kladde::config::STAMP,
             Self::StampCreatedKey => kladde::config::STAMP_CREATED_KEY,
             Self::StampUpdatedKey => kladde::config::STAMP_UPDATED_KEY,
@@ -258,11 +343,16 @@ fn main() -> ExitCode {
     match Cli::parse().command {
         Command::Config(command) => config(command),
         Command::Path { target, notebook } => {
-            dispatch(target, notebook.notebook, None, |note, _guard| {
+            dispatch(target, notebook.notebook, None, |note, _guard, _seed| {
                 print_path(note.as_path());
                 ExitCode::SUCCESS
             })
         }
+        Command::Read { target, notebook } => read(target, notebook.notebook),
+        Command::List { notebook } => list(notebook.notebook),
+        Command::Search { query, notebook } => search(&query, notebook.notebook),
+        Command::Open { target, notebook } => open_note(target, notebook.notebook),
+        Command::New { target, notebook } => new_note(target.into(), notebook.notebook),
         Command::Append {
             text,
             under,
@@ -279,22 +369,41 @@ const NO_NOTEBOOK: &str = "no notebook: pass --notebook or set the default-noteb
 const NO_STATE_DIR: &str =
     "cannot locate the state directory: neither XDG_STATE_HOME nor HOME is set";
 
+/// The contents a write seeds a missing daily note with: `None` when no
+/// template applies, `Some(Err(_))` when a template is configured but
+/// cannot seed — an error that surfaces only when a write actually needs
+/// the seed, so a broken template never blocks a write to an existing
+/// note.
+type Seed = Option<Result<String, String>>;
+
 /// Resolves the note a command targets and runs `act` on it. With
 /// `locks`, the notebook's lock is taken before the note is resolved and
 /// `act` receives a guard: resolution racing another writer's atomic
 /// replace can transiently misread the filesystem, so writers resolve
-/// inside the critical section.
+/// inside the critical section. Only daily resolution carries a seed;
+/// an explicit target never seeds, even one spelling a daily note's
+/// path.
 fn dispatch(
     target: TargetArgs,
     flag: Option<PathBuf>,
     locks: Option<&Path>,
-    act: impl FnOnce(&Note, Option<&kladde::write::Guard>) -> ExitCode,
+    act: impl FnOnce(&Note, Option<&kladde::write::Guard>, Seed) -> ExitCode,
 ) -> ExitCode {
     if let Some(relative) = target.target {
-        return with_notebook(flag, locks, |notebook| notebook.note(&relative), act);
+        return with_notebook(
+            flag,
+            locks,
+            |notebook| Ok((notebook.note(&relative)?, None)),
+            act,
+        );
     }
     if let Some(name) = target.name {
-        return with_notebook(flag, locks, |notebook| notebook.find(&name), act);
+        return with_notebook(
+            flag,
+            locks,
+            |notebook| Ok((notebook.find(&name)?, None)),
+            act,
+        );
     }
     daily_note(target.date, flag, locks, act)
 }
@@ -329,14 +438,169 @@ fn append(
         indent: config.bullet_indent.unwrap_or_default(),
     };
     let stamping = stamping(config);
-    dispatch(target, flag, Some(&locks), |note, guard| {
+    dispatch(target, flag, Some(&locks), |note, guard, seed| {
         let guard = guard.expect("write dispatch locks the notebook");
+        let seed = match seeding(&seed) {
+            Ok(seed) => seed,
+            Err(message) => return fail(message),
+        };
         let timestamp = stamping.timestamp(note);
         match guard.append(
             text,
+            seed,
             &placement,
             stamping.stamp(timestamp.as_deref()).as_ref(),
         ) {
+            Ok(()) => {
+                print_path(note.as_path());
+                ExitCode::SUCCESS
+            }
+            Err(error) => fail(error),
+        }
+    })
+}
+
+/// Prints a note's contents without taking the notebook's lock: the
+/// atomic replace means a reader never sees a half-written note, and a
+/// read must not create or wait for anything.
+fn read(target: TargetArgs, flag: Option<PathBuf>) -> ExitCode {
+    dispatch(target, flag, None, |note, _guard, _seed| {
+        let path = note.as_path();
+        match std::fs::read_to_string(path) {
+            Ok(contents) => {
+                print_contents(&contents);
+                ExitCode::SUCCESS
+            }
+            Err(error) => fail(format!("cannot read {}: {error}", path.display())),
+        }
+    })
+}
+
+/// Lists every note as a notebook-relative path, without taking the
+/// notebook's lock.
+fn list(flag: Option<PathBuf>) -> ExitCode {
+    let (_, notes) = match listed(flag) {
+        Ok(listed) => listed,
+        Err(message) => return fail(message),
+    };
+    for note in notes {
+        print_path(&note);
+    }
+    ExitCode::SUCCESS
+}
+
+/// The notebook's notes, ready for one-path-per-line output: a name
+/// holding a line break would let one note print as several, so the
+/// listing commands refuse it loudly instead — wherever it sits in the
+/// notebook, matched or not, because a forged-looking listing is worse
+/// than a failed one.
+fn listed(flag: Option<PathBuf>) -> Result<(kladde::notebook::Notebook, Vec<PathBuf>), String> {
+    let notebook = opened(flag)?;
+    let notes = notebook.notes().map_err(|error| error.to_string())?;
+    for note in &notes {
+        printable(note)?;
+    }
+    Ok((notebook, notes))
+}
+
+/// Checks a note name against the one-path-per-line output contract.
+/// The lossy conversion keeps line-break bytes, so a non-Unicode name
+/// cannot smuggle one past the check. The message is built eagerly:
+/// only Unix can create a failing name, so a lazy closure would never
+/// run on Windows and its lines would fail the coverage gate there.
+fn printable(note: &Path) -> Result<(), String> {
+    let name = note.to_string_lossy();
+    let message = format!(
+        "note name \"{}\" contains a line break",
+        name.escape_debug()
+    );
+    let clean = !name.contains(['\n', '\r']);
+    clean.then_some(()).ok_or(message)
+}
+
+/// Finds the notes containing `query`, without taking the notebook's
+/// lock. Both sides are folded with Unicode default case folding — the
+/// folding name lookup uses — so STRASSE finds Straße; spellings that
+/// differ by normalization stay distinct, as they do everywhere in
+/// kladde.
+fn search(query: &str, flag: Option<PathBuf>) -> ExitCode {
+    if query.is_empty() {
+        return fail("nothing to search for: the query is empty");
+    }
+    let (notebook, notes) = match listed(flag) {
+        Ok(listed) => listed,
+        Err(message) => return fail(message),
+    };
+    let needle = caseless::default_case_fold_str(query);
+    // Matches are held back until every note has been read: a read
+    // failure midway must not leave a plausible partial result on
+    // stdout, particularly when the failure exit code is also the
+    // no-match one.
+    let mut matches = Vec::new();
+    for note in notes {
+        let path = notebook.root().join(&note);
+        let contents = match std::fs::read_to_string(&path) {
+            Ok(contents) => contents,
+            Err(error) => return fail(format!("cannot read {}: {error}", path.display())),
+        };
+        if caseless::default_case_fold_str(&contents).contains(&needle) {
+            matches.push(note);
+        }
+    }
+    if matches.is_empty() {
+        return ExitCode::FAILURE;
+    }
+    for note in &matches {
+        print_path(note);
+    }
+    ExitCode::SUCCESS
+}
+
+/// Opens a note in the editor, without taking the notebook's lock and
+/// without creating anything. The editor chain matches `config open`,
+/// but the config load does not: a broken config is an error here, since
+/// resolving a daily note needs the daily keys, while `config open`
+/// stays lenient so a broken config file can be opened and fixed.
+fn open_note(target: TargetArgs, flag: Option<PathBuf>) -> ExitCode {
+    let config = match loaded_config(flag.is_some()) {
+        Ok(config) => config,
+        Err(message) => return fail(message),
+    };
+    let command = config
+        .editor
+        .or_else(|| editor_env("VISUAL"))
+        .or_else(|| editor_env("EDITOR"));
+    dispatch(
+        target,
+        flag,
+        None,
+        |note, _guard, _seed| match kladde::editor::open(note.as_path(), command.as_deref()) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => fail(error),
+        },
+    )
+}
+
+/// Creates a note under the notebook's lock, seeded and stamped like any
+/// other creating write; an existing note is a success left untouched.
+fn new_note(target: TargetArgs, flag: Option<PathBuf>) -> ExitCode {
+    let locks = match locks() {
+        Ok(locks) => locks,
+        Err(message) => return fail(message),
+    };
+    let config = match loaded_config(flag.is_some()) {
+        Ok(config) => config,
+        Err(message) => return fail(message),
+    };
+    let stamping = stamping(config);
+    dispatch(target, flag, Some(&locks), |note, guard, seed| {
+        let guard = guard.expect("write dispatch locks the notebook");
+        let seed = match seeding(&seed) {
+            Ok(seed) => seed,
+            Err(message) => return fail(message),
+        };
+        let timestamp = stamping.timestamp(note);
+        match guard.create(seed, stamping.stamp(timestamp.as_deref()).as_ref()) {
             Ok(()) => {
                 print_path(note.as_path());
                 ExitCode::SUCCESS
@@ -452,14 +716,14 @@ fn frontmatter(command: FrontmatterCommand) -> ExitCode {
             value,
             target,
             notebook,
-        } => frontmatter_edit(target, notebook.notebook, |current| {
+        } => frontmatter_edit(target, notebook.notebook, true, |current| {
             kladde::frontmatter::set(current, &key, &value)
         }),
         FrontmatterCommand::Unset {
             key,
             target,
             notebook,
-        } => frontmatter_edit(target, notebook.notebook, |current| {
+        } => frontmatter_edit(target, notebook.notebook, false, |current| {
             kladde::frontmatter::unset(current, &key)
         }),
         FrontmatterCommand::Add {
@@ -467,7 +731,7 @@ fn frontmatter(command: FrontmatterCommand) -> ExitCode {
             item,
             target,
             notebook,
-        } => frontmatter_edit(target, notebook.notebook, |current| {
+        } => frontmatter_edit(target, notebook.notebook, true, |current| {
             kladde::frontmatter::add(current, &key, &item)
         }),
         FrontmatterCommand::Remove {
@@ -475,7 +739,7 @@ fn frontmatter(command: FrontmatterCommand) -> ExitCode {
             item,
             target,
             notebook,
-        } => frontmatter_edit(target, notebook.notebook, |current| {
+        } => frontmatter_edit(target, notebook.notebook, false, |current| {
             kladde::frontmatter::remove(current, &key, &item)
         }),
     }
@@ -485,7 +749,7 @@ fn frontmatter(command: FrontmatterCommand) -> ExitCode {
 /// atomic replace means a reader never sees a half-written note, and a
 /// read must not create or wait for anything.
 fn frontmatter_get(key: &str, target: TargetArgs, flag: Option<PathBuf>) -> ExitCode {
-    dispatch(target, flag, None, |note, _guard| {
+    dispatch(target, flag, None, |note, _guard, _seed| {
         let path = note.as_path();
         let contents = match std::fs::read_to_string(path) {
             Ok(contents) => contents,
@@ -512,10 +776,14 @@ fn frontmatter_get(key: &str, target: TargetArgs, flag: Option<PathBuf>) -> Exit
 /// Runs a frontmatter edit under the notebook's lock: read, transform,
 /// stamp, atomically replace. An edit that changes nothing skips the
 /// write and the stamp, so an idempotent edit cannot create a note or
-/// bump its updated stamp.
+/// bump its updated stamp — except that an edit that `creates` (set and
+/// add, whose outcome is a readable property) must leave the note
+/// existing: when a template seed already satisfies it, the seed is
+/// written as a creation rather than skipped.
 fn frontmatter_edit(
     target: TargetArgs,
     flag: Option<PathBuf>,
+    creates: bool,
     edit: impl FnOnce(&str) -> Result<String, kladde::frontmatter::Error>,
 ) -> ExitCode {
     let locks = match locks() {
@@ -527,9 +795,13 @@ fn frontmatter_edit(
         Err(message) => return fail(message),
     };
     let stamping = stamping(config);
-    dispatch(target, flag, Some(&locks), |note, guard| {
+    dispatch(target, flag, Some(&locks), |note, guard, seed| {
         let guard = guard.expect("write dispatch locks the notebook");
-        let current = match guard.current() {
+        let seed = match seeding(&seed) {
+            Ok(seed) => seed,
+            Err(message) => return fail(message),
+        };
+        let (current, existed) = match guard.current(seed) {
             Ok(current) => current,
             Err(error) => return fail(error),
         };
@@ -537,8 +809,8 @@ fn frontmatter_edit(
             Ok(new) => new,
             Err(error) => return fail(error),
         };
-        if new != current {
-            let had_block = kladde::frontmatter::has_block(&current);
+        if new != current || (creates && !existed) {
+            let had_block = existed && kladde::frontmatter::has_block(&current);
             let timestamp = stamping.timestamp(note);
             let stamped = match stamping.stamp(timestamp.as_deref()) {
                 Some(stamp) => kladde::frontmatter::stamped(&new, had_block, &stamp),
@@ -553,32 +825,36 @@ fn frontmatter_edit(
     })
 }
 
+/// Resolves the notebook root and opens the notebook there.
+fn opened(flag: Option<PathBuf>) -> Result<kladde::notebook::Notebook, String> {
+    let root = notebook_root(flag)?;
+    kladde::notebook::Notebook::open(&root).map_err(|error| error.to_string())
+}
+
 /// Resolves the notebook root, opens it, takes its lock when `locks`
-/// asks for one, and runs `act` on the note `resolve` picks inside it.
+/// asks for one, and runs `act` on the note (and seed) `resolve` picks
+/// inside it. Resolution runs after the lock is taken, so a seed read
+/// from a template file is serialized like the note itself.
 fn with_notebook(
     flag: Option<PathBuf>,
     locks: Option<&Path>,
-    resolve: impl FnOnce(&kladde::notebook::Notebook) -> Result<Note, kladde::notebook::Error>,
-    act: impl FnOnce(&Note, Option<&kladde::write::Guard>) -> ExitCode,
+    resolve: impl FnOnce(&kladde::notebook::Notebook) -> Result<(Note, Seed), kladde::notebook::Error>,
+    act: impl FnOnce(&Note, Option<&kladde::write::Guard>, Seed) -> ExitCode,
 ) -> ExitCode {
-    let root = match notebook_root(flag) {
-        Ok(root) => root,
-        Err(message) => return fail(message),
-    };
-    let notebook = match kladde::notebook::Notebook::open(&root) {
+    let notebook = match opened(flag) {
         Ok(notebook) => notebook,
-        Err(error) => return fail(error),
+        Err(message) => return fail(message),
     };
     let lock = match locked(locks, notebook.root()) {
         Ok(lock) => lock,
         Err(error) => return fail(error),
     };
-    let note = match resolve(&notebook) {
-        Ok(note) => note,
+    let (note, seed) = match resolve(&notebook) {
+        Ok(resolved) => resolved,
         Err(error) => return fail(error),
     };
     let guard = lock.as_ref().map(|lock| lock.guard(&note));
-    act(&note, guard.as_ref())
+    act(&note, guard.as_ref(), seed)
 }
 
 /// The notebook's lock, when a write asked for one.
@@ -601,7 +877,7 @@ fn daily_note(
     date: Option<String>,
     flag: Option<PathBuf>,
     locks: Option<&Path>,
-    act: impl FnOnce(&Note, Option<&kladde::write::Guard>) -> ExitCode,
+    act: impl FnOnce(&Note, Option<&kladde::write::Guard>, Seed) -> ExitCode,
 ) -> ExitCode {
     let config = match loaded_config(flag.is_some()) {
         Ok(config) => config,
@@ -622,9 +898,76 @@ fn daily_note(
     with_notebook(
         Some(root),
         locks,
-        |notebook| notebook.daily(day, config.daily_folder.as_deref(), &format),
+        |notebook| {
+            let note = notebook.daily(day, config.daily_folder.as_deref(), &format)?;
+            let seed = daily_seed(
+                notebook,
+                config.daily_template.as_deref(),
+                locks.is_some(),
+                day,
+                &note,
+            );
+            Ok((note, seed))
+        },
         act,
     )
+}
+
+/// The seed for a missing daily note: the configured template's
+/// contents, rendered for the note's date. `None` without a configured
+/// template, `None` for reads — only a write can need a seed, so read
+/// commands never touch the template file at all — and `None` when the
+/// note already exists, so the template is read only by the write that
+/// will use it. The existence probe runs under the write lock, like the
+/// write it feeds. A template that cannot be resolved, read, or
+/// rendered becomes the error the write surfaces.
+fn daily_seed(
+    notebook: &kladde::notebook::Notebook,
+    template: Option<&Path>,
+    writing: bool,
+    date: jiff::civil::Date,
+    note: &Note,
+) -> Seed {
+    let template = template.filter(|_| writing && !note.as_path().exists())?;
+    let resolved = match notebook.note(template) {
+        Ok(resolved) => resolved,
+        Err(error) => return Some(Err(error.to_string())),
+    };
+    let text = match std::fs::read_to_string(resolved.as_path()) {
+        Ok(text) => text,
+        Err(error) => {
+            return Some(Err(format!(
+                "cannot read template {}: {error}",
+                resolved.as_path().display()
+            )));
+        }
+    };
+    let time = jiff::Zoned::now().time();
+    Some(
+        kladde::template::rendered(&text, date, time, &title(note))
+            .map_err(|error| error.to_string()),
+    )
+}
+
+/// The note's title, the value `{{title}}` renders to: the file name
+/// without its `.md` extension.
+fn title(note: &Note) -> String {
+    note.as_path()
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// Resolves the seed for a write: a seed exists only when the note was
+/// missing under this lock, so a broken template fails exactly the
+/// write that would have needed it.
+fn seeding(seed: &Seed) -> Result<Option<&str>, &str> {
+    match seed {
+        None => Ok(None),
+        Some(Ok(rendered)) => Ok(Some(rendered)),
+        Some(Err(message)) => Err(message),
+    }
 }
 
 /// The config a command draws optional keys from: the daily note keys and
@@ -690,99 +1033,38 @@ fn get(file: &Path, key: ConfigKey) -> ExitCode {
         Err(error) => return fail(error),
     };
     match key {
-        ConfigKey::DefaultNotebook => {
-            if let Some(notebook) = config.default_notebook {
-                print_path(&notebook);
-                ExitCode::SUCCESS
-            } else {
-                ExitCode::FAILURE
-            }
-        }
-        ConfigKey::Editor => {
-            if let Some(editor) = config.editor {
-                println!("{editor}");
-                ExitCode::SUCCESS
-            } else {
-                ExitCode::FAILURE
-            }
-        }
-        ConfigKey::DailyFolder => {
-            if let Some(folder) = config.daily_folder {
-                print_path(&folder);
-                ExitCode::SUCCESS
-            } else {
-                ExitCode::FAILURE
-            }
-        }
-        ConfigKey::DailyDateFormat => {
-            if let Some(format) = config.daily_date_format {
-                println!("{}", format.as_str());
-                ExitCode::SUCCESS
-            } else {
-                ExitCode::FAILURE
-            }
-        }
-        ConfigKey::Stamp => {
-            if let Some(stamp) = config.stamp {
-                println!("{stamp}");
-                ExitCode::SUCCESS
-            } else {
-                ExitCode::FAILURE
-            }
-        }
-        ConfigKey::StampCreatedKey => {
-            if let Some(key) = config.stamp_created_key {
-                println!("{key}");
-                ExitCode::SUCCESS
-            } else {
-                ExitCode::FAILURE
-            }
-        }
-        ConfigKey::StampUpdatedKey => {
-            if let Some(key) = config.stamp_updated_key {
-                println!("{key}");
-                ExitCode::SUCCESS
-            } else {
-                ExitCode::FAILURE
-            }
-        }
-        ConfigKey::StampFormat => {
-            if let Some(format) = config.stamp_format {
-                println!("{}", format.as_str());
-                ExitCode::SUCCESS
-            } else {
-                ExitCode::FAILURE
-            }
-        }
-        ConfigKey::StampExclude => {
-            if let Some(entries) = config.stamp_exclude {
-                // Entries print with `/` on every platform, the spelling
-                // the config file stores, not the platform separator.
-                let joined = entries
-                    .iter()
-                    .map(|entry| {
-                        entry
-                            .components()
-                            .map(|component| component.as_os_str().to_string_lossy())
-                            .collect::<Vec<_>>()
-                            .join("/")
-                    })
-                    .collect::<Vec<_>>()
-                    .join(",");
-                println!("{joined}");
-                ExitCode::SUCCESS
-            } else {
-                ExitCode::FAILURE
-            }
-        }
-        ConfigKey::BulletIndent => {
-            if let Some(indent) = config.bullet_indent {
-                println!("{}", indent.as_str());
-                ExitCode::SUCCESS
-            } else {
-                ExitCode::FAILURE
-            }
-        }
+        ConfigKey::DefaultNotebook => printed(config.default_notebook, |path| print_path(path)),
+        ConfigKey::Editor => printed(config.editor, |editor| println!("{editor}")),
+        ConfigKey::DailyFolder => printed(config.daily_folder, |folder| print_path(folder)),
+        ConfigKey::DailyDateFormat => printed(config.daily_date_format, |format| {
+            println!("{}", format.as_str());
+        }),
+        ConfigKey::DailyTemplate => printed(config.daily_template, |template| print_path(template)),
+        ConfigKey::Stamp => printed(config.stamp, |stamp| println!("{stamp}")),
+        ConfigKey::StampCreatedKey => printed(config.stamp_created_key, |key| println!("{key}")),
+        ConfigKey::StampUpdatedKey => printed(config.stamp_updated_key, |key| println!("{key}")),
+        ConfigKey::StampFormat => printed(config.stamp_format, |format| {
+            println!("{}", format.as_str());
+        }),
+        ConfigKey::StampExclude => printed(config.stamp_exclude, |entries| {
+            // Entries print with `/` on every platform, the spelling
+            // the config file stores, not the platform separator.
+            let joined = entries
+                .iter()
+                .map(|entry| {
+                    entry
+                        .components()
+                        .map(|component| component.as_os_str().to_string_lossy())
+                        .collect::<Vec<_>>()
+                        .join("/")
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            println!("{joined}");
+        }),
+        ConfigKey::BulletIndent => printed(config.bullet_indent, |indent| {
+            println!("{}", indent.as_str());
+        }),
     }
 }
 
@@ -795,12 +1077,25 @@ fn set(file: &Path, key: ConfigKey, value: &str) -> ExitCode {
         ConfigKey::Editor => finish(kladde::config::set_editor(file, value)),
         ConfigKey::DailyFolder => finish(kladde::config::set_daily_folder(file, value)),
         ConfigKey::DailyDateFormat => finish(kladde::config::set_daily_date_format(file, value)),
+        ConfigKey::DailyTemplate => finish(kladde::config::set_daily_template(file, value)),
         ConfigKey::Stamp => finish(kladde::config::set_stamp(file, value)),
         ConfigKey::StampCreatedKey => finish(kladde::config::set_stamp_created_key(file, value)),
         ConfigKey::StampUpdatedKey => finish(kladde::config::set_stamp_updated_key(file, value)),
         ConfigKey::StampFormat => finish(kladde::config::set_stamp_format(file, value)),
         ConfigKey::StampExclude => finish(kladde::config::set_stamp_exclude(file, value)),
         ConfigKey::BulletIndent => finish(kladde::config::set_bullet_indent(file, value)),
+    }
+}
+
+/// Prints a config value when it is set; an unset key prints nothing and
+/// fails, so scripts can tell set from unset.
+fn printed<T>(value: Option<T>, print: impl FnOnce(&T)) -> ExitCode {
+    match value {
+        Some(value) => {
+            print(&value);
+            ExitCode::SUCCESS
+        }
+        None => ExitCode::FAILURE,
     }
 }
 
@@ -824,11 +1119,17 @@ fn open(file: &Path) -> ExitCode {
     }
 }
 
-/// An editor command from the environment; a blank value counts as unset.
+/// An editor command from the environment. A value that parses to no
+/// program — blank, or quoted emptiness like `''` — counts as unset, so
+/// the chain falls through to the next candidate; a value that cannot
+/// be parsed at all is kept, to fail loudly rather than be skipped
+/// silently.
 fn editor_env(name: &str) -> Option<String> {
-    env::var(name)
-        .ok()
-        .filter(|value| value.split_whitespace().next().is_some())
+    env::var(name).ok().filter(|value| {
+        shell_words::split(value).map_or(true, |words| {
+            words.first().is_some_and(|program| !program.is_empty())
+        })
+    })
 }
 
 fn finish(result: Result<(), kladde::config::Error>) -> ExitCode {
@@ -843,18 +1144,35 @@ fn finish(result: Result<(), kladde::config::Error>) -> ExitCode {
 /// bytes and print a path that does not exist.
 #[cfg(unix)]
 fn print_path(path: &Path) {
-    use std::io::Write;
     use std::os::unix::ffi::OsStrExt;
-    let mut stdout = std::io::stdout();
-    stdout
-        .write_all(path.as_os_str().as_bytes())
-        .and_then(|()| stdout.write_all(b"\n"))
-        .expect("stdout writes");
+    let mut bytes = path.as_os_str().as_bytes().to_vec();
+    bytes.push(b'\n');
+    write_stdout(&bytes);
 }
 
 #[cfg(windows)]
 fn print_path(path: &Path) {
-    println!("{}", path.display());
+    write_stdout(format!("{}\n", path.display()).as_bytes());
+}
+
+/// Prints text exactly as given.
+fn print_contents(contents: &str) {
+    write_stdout(contents.as_bytes());
+}
+
+/// Writes to stdout, flushed, so a final line without a newline still
+/// leaves the buffer. A broken pipe means the reader stopped listening —
+/// `kladde read note.md | head` — which is the reader's call: the
+/// process ends quietly as a success. Any other stdout failure has no
+/// better report channel than the panic.
+fn write_stdout(bytes: &[u8]) {
+    use std::io::Write;
+    let mut stdout = std::io::stdout();
+    if let Err(error) = stdout.write_all(bytes).and_then(|()| stdout.flush()) {
+        let broken = error.kind() == std::io::ErrorKind::BrokenPipe;
+        assert!(broken, "stdout writes: {error}");
+        std::process::exit(0);
+    }
 }
 
 fn fail(message: impl Display) -> ExitCode {

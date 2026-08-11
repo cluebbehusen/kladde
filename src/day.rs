@@ -23,6 +23,8 @@ pub enum Error {
     InvalidFormat { value: String, cause: jiff::Error },
     #[error("date format \"{value}\" renders an empty file name")]
     EmptyFormat { value: String },
+    #[error("date format \"{value}\" renders a line break into a file name")]
+    LineBreakFormat { value: String },
     #[error("timestamp format \"{value}\" is invalid: {cause}")]
     InvalidStamp { value: String, cause: jiff::Error },
     #[error("timestamp format \"{value}\" renders nothing")]
@@ -43,8 +45,10 @@ impl Format {
     /// # Errors
     ///
     /// Returns an error when `value` cannot render a date (an unknown
-    /// directive, or one needing more than a calendar date, like `%H`) or
-    /// renders an empty file name.
+    /// directive, or one needing more than a calendar date, like `%H`),
+    /// renders an empty file name, or renders a line break (`%n`) into
+    /// the file name — a note named across lines would break the
+    /// one-path-per-line output of the listing commands.
     pub fn new(value: &str) -> Result<Self, Error> {
         let probe = jiff::civil::date(2001, 2, 3);
         let rendered = strtime::format(value, probe).map_err(|cause| Error::InvalidFormat {
@@ -53,6 +57,11 @@ impl Format {
         })?;
         if rendered.is_empty() {
             return Err(Error::EmptyFormat {
+                value: value.to_owned(),
+            });
+        }
+        if rendered.contains(['\n', '\r']) {
+            return Err(Error::LineBreakFormat {
                 value: value.to_owned(),
             });
         }
@@ -204,6 +213,19 @@ mod tests {
     fn format_rejects_an_empty_rendering() {
         let error = Format::new("").expect_err("empty format fails");
         assert!(error.to_string().contains("renders an empty file name"));
+    }
+
+    /// `%n` renders a real newline, which a file name may legally hold
+    /// on Unix — and which would then break the one-path-per-line
+    /// output of the listing commands, so it never gets that far.
+    #[test]
+    fn format_rejects_a_line_break_rendering() {
+        let error = Format::new("%Y%n").expect_err("line break fails");
+        assert!(
+            error
+                .to_string()
+                .contains("renders a line break into a file name")
+        );
     }
 
     #[test]

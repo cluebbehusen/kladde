@@ -23,6 +23,10 @@ pub const DAILY_FOLDER: &str = "daily-folder";
 /// Config key naming the strftime format for daily note file names.
 pub const DAILY_DATE_FORMAT: &str = "daily-date-format";
 
+/// Config key naming the note, inside the notebook, that seeds a daily
+/// note kladde creates.
+pub const DAILY_TEMPLATE: &str = "daily-template";
+
 /// Config key switching created/updated stamping on or off.
 pub const STAMP: &str = "stamp";
 
@@ -50,7 +54,8 @@ pub const BULLET_INDENT: &str = "bullet-indent";
 pub struct Config {
     /// Notebook used when a command is not given an explicit notebook.
     pub default_notebook: Option<PathBuf>,
-    /// Command that opens files in an editor, split on whitespace when run.
+    /// Command that opens files in an editor, parsed with shell quoting
+    /// rules when run.
     pub editor: Option<String>,
     /// Folder inside the notebook that holds daily notes; unset means the
     /// notebook root.
@@ -58,6 +63,9 @@ pub struct Config {
     /// strftime format for daily note file names; unset means
     /// [`day::DEFAULT_FORMAT`].
     pub daily_date_format: Option<day::Format>,
+    /// Notebook-relative path of the note that seeds a daily note kladde
+    /// creates; unset means daily notes start empty.
+    pub daily_template: Option<PathBuf>,
     /// Whether writes stamp created/updated properties; unset means true.
     pub stamp: Option<bool>,
     /// Property name for the created stamp; unset means `created`.
@@ -96,10 +104,14 @@ pub enum Error {
     NotAbsolute { key: &'static str, value: String },
     #[error("`editor` must contain a command")]
     EmptyEditor,
+    #[error("`editor`: {cause}")]
+    UnparsableEditor { cause: shell_words::ParseError },
     #[error("`{key}` must be a relative path, got \"{value}\"")]
     NotRelative { key: &'static str, value: String },
     #[error("`daily-folder` must not be empty")]
     EmptyDailyFolder,
+    #[error("`daily-template` must not be empty")]
+    EmptyDailyTemplate,
     #[error("`daily-date-format`: {cause}")]
     InvalidDateFormat { cause: day::Error },
     #[error("`{key}` must be true or false")]
@@ -165,9 +177,9 @@ pub fn file(xdg_config_home: Option<PathBuf>, home: Option<PathBuf>) -> Option<P
 ///
 /// Returns an error when the file cannot be read, is not valid TOML, contains
 /// an unknown key, or holds a value of the wrong shape: `default-notebook`
-/// must be an absolute path, `editor` must contain a command, `daily-folder`
-/// must be a non-empty relative path, and `daily-date-format` must render a
-/// date.
+/// must be an absolute path, `editor` must be a shell-parsable command,
+/// `daily-folder` must be a non-empty relative path, and
+/// `daily-date-format` must render a date.
 pub fn load(file: &Path) -> Result<Config, Error> {
     let document = read_document(file)?;
     let mut config = Config::default();
@@ -188,9 +200,7 @@ pub fn load(file: &Path) -> Result<Config, Error> {
             }
             EDITOR => {
                 let value = item.as_str().ok_or(Error::NotAString { key: EDITOR })?;
-                if value.split_whitespace().next().is_none() {
-                    return Err(Error::EmptyEditor);
-                }
+                validated_editor(value)?;
                 config.editor = Some(value.to_owned());
             }
             DAILY_FOLDER => {
@@ -206,6 +216,12 @@ pub fn load(file: &Path) -> Result<Config, Error> {
                 let format =
                     day::Format::new(value).map_err(|cause| Error::InvalidDateFormat { cause })?;
                 config.daily_date_format = Some(format);
+            }
+            DAILY_TEMPLATE => {
+                let value = item.as_str().ok_or(Error::NotAString {
+                    key: DAILY_TEMPLATE,
+                })?;
+                config.daily_template = Some(validated_daily_template(value)?);
             }
             STAMP => {
                 config.stamp = Some(item.as_bool().ok_or(Error::NotABoolean { key: STAMP })?);
@@ -294,12 +310,11 @@ pub fn set_default_notebook(file: &Path, notebook: &Path) -> Result<(), Error> {
 ///
 /// # Errors
 ///
-/// Returns an error when `editor` contains no command, or when the config
-/// file cannot be read, parsed, or written back.
+/// Returns an error when `editor` contains no command or does not parse
+/// under shell quoting rules, or when the config file cannot be read,
+/// parsed, or written back.
 pub fn set_editor(file: &Path, editor: &str) -> Result<(), Error> {
-    if editor.split_whitespace().next().is_none() {
-        return Err(Error::EmptyEditor);
-    }
+    validated_editor(editor)?;
     let mut document = read_document(file)?;
     document[EDITOR] = toml_edit::value(editor);
     save(file, &document)
@@ -333,6 +348,21 @@ pub fn set_daily_date_format(file: &Path, format: &str) -> Result<(), Error> {
     day::Format::new(format).map_err(|cause| Error::InvalidDateFormat { cause })?;
     let mut document = read_document(file)?;
     document[DAILY_DATE_FORMAT] = toml_edit::value(format);
+    save(file, &document)
+}
+
+/// Stores `template` under the `daily-template` key, creating the config
+/// file and its directory if needed and preserving the rest of the file,
+/// comments included.
+///
+/// # Errors
+///
+/// Returns an error when `template` is empty or rooted, or when the
+/// config file cannot be read, parsed, or written back.
+pub fn set_daily_template(file: &Path, template: &str) -> Result<(), Error> {
+    validated_daily_template(template)?;
+    let mut document = read_document(file)?;
+    document[DAILY_TEMPLATE] = toml_edit::value(template);
     save(file, &document)
 }
 
@@ -438,6 +468,17 @@ pub fn set_bullet_indent(file: &Path, value: &str) -> Result<(), Error> {
     save(file, &document)
 }
 
+/// An `editor` value must parse under the shell quoting rules
+/// [`crate::editor::open`] applies, and its first word — the program — must
+/// not be empty, which is also how a blank value is rejected.
+fn validated_editor(value: &str) -> Result<(), Error> {
+    let words = shell_words::split(value).map_err(|cause| Error::UnparsableEditor { cause })?;
+    match words.first() {
+        Some(program) if !program.is_empty() => Ok(()),
+        _ => Err(Error::EmptyEditor),
+    }
+}
+
 /// A `bullet-indent` value names one of the two indent units.
 fn validated_bullet_indent(value: &str) -> Result<structure::Indent, Error> {
     match value {
@@ -505,6 +546,23 @@ fn validated_daily_folder(value: &str) -> Result<PathBuf, Error> {
         });
     }
     Ok(folder)
+}
+
+/// A `daily-template` value must name a note inside the notebook, so it
+/// has to be non-empty and relative; containment proper is enforced when
+/// the template is resolved against a notebook.
+fn validated_daily_template(value: &str) -> Result<PathBuf, Error> {
+    if value.is_empty() {
+        return Err(Error::EmptyDailyTemplate);
+    }
+    let template = PathBuf::from(value);
+    if template.has_root() {
+        return Err(Error::NotRelative {
+            key: DAILY_TEMPLATE,
+            value: value.to_owned(),
+        });
+    }
+    Ok(template)
 }
 
 /// Removes `key` from the config file, preserving the rest of the file,
@@ -742,6 +800,31 @@ mod tests {
     }
 
     #[test]
+    fn load_rejects_unparsable_editor() {
+        let base = temp();
+        let file = base.path().join("config.toml");
+        fs::write(&file, "editor = \"'unclosed\"\n").expect("fixture writes");
+        let error = load(&file).expect_err("unclosed quote fails");
+        assert!(
+            error.to_string().contains("`editor`:"),
+            "unexpected: {error}"
+        );
+    }
+
+    #[test]
+    fn load_rejects_quoted_empty_editor() {
+        let base = temp();
+        let file = base.path().join("config.toml");
+        fs::write(&file, "editor = \"'' --wait\"\n").expect("fixture writes");
+        let error = load(&file).expect_err("empty program fails");
+        assert!(
+            error
+                .to_string()
+                .contains("`editor` must contain a command")
+        );
+    }
+
+    #[test]
     fn set_default_notebook_creates_file_and_directories() {
         let base = temp();
         let notebook = temp();
@@ -895,6 +978,69 @@ mod tests {
     }
 
     #[test]
+    fn load_reads_daily_template() {
+        let base = temp();
+        let file = base.path().join("config.toml");
+        fs::write(&file, "daily-template = 'templates/Daily.md'\n").expect("fixture writes");
+        let config = load(&file).expect("fixture loads");
+        assert_eq!(
+            config.daily_template,
+            Some(PathBuf::from("templates/Daily.md"))
+        );
+    }
+
+    #[test]
+    fn load_rejects_daily_template_of_the_wrong_shape() {
+        let base = temp();
+        let file = base.path().join("config.toml");
+        let cases = [
+            ("daily-template = 3\n", "`daily-template` must be a string"),
+            (
+                "daily-template = ''\n",
+                "`daily-template` must not be empty",
+            ),
+            (
+                "daily-template = '/rooted.md'\n",
+                "`daily-template` must be a relative path",
+            ),
+        ];
+        for (contents, fragment) in cases {
+            fs::write(&file, contents).expect("fixture writes");
+            let error = load(&file).expect_err("bad template fails");
+            assert!(
+                error.to_string().contains(fragment),
+                "for {contents:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn set_daily_template_round_trips_and_validates() {
+        let base = temp();
+        let file = base.path().join("config.toml");
+        set_daily_template(&file, "templates/Daily.md").expect("set succeeds");
+        let config = load(&file).expect("written config loads");
+        assert_eq!(
+            config.daily_template,
+            Some(PathBuf::from("templates/Daily.md"))
+        );
+        let missing = base.path().join("nested").join("config.toml");
+        let error = set_daily_template(&missing, "").expect_err("empty template fails");
+        assert!(
+            error
+                .to_string()
+                .contains("`daily-template` must not be empty")
+        );
+        let error = set_daily_template(&missing, "/rooted.md").expect_err("rooted template fails");
+        assert!(
+            error
+                .to_string()
+                .contains("`daily-template` must be a relative path")
+        );
+        assert!(!missing.exists());
+    }
+
+    #[test]
     fn load_rejects_unknown_date_directive() {
         let base = temp();
         let file = base.path().join("config.toml");
@@ -986,6 +1132,30 @@ mod tests {
             error
                 .to_string()
                 .contains("`editor` must contain a command")
+        );
+        assert!(!file.exists());
+    }
+
+    #[test]
+    fn set_editor_stores_quoted_command() {
+        let base = temp();
+        let file = base.path().join("config.toml");
+        set_editor(&file, "'/opt/spaced out/editor' --wait").expect("set succeeds");
+        let config = load(&file).expect("written config loads");
+        assert_eq!(
+            config.editor,
+            Some("'/opt/spaced out/editor' --wait".to_owned())
+        );
+    }
+
+    #[test]
+    fn set_editor_rejects_unparsable_command() {
+        let base = temp();
+        let file = base.path().join("config.toml");
+        let error = set_editor(&file, "'unclosed").expect_err("unclosed quote fails");
+        assert!(
+            error.to_string().contains("`editor`:"),
+            "unexpected: {error}"
         );
         assert!(!file.exists());
     }

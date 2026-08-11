@@ -10,4 +10,5 @@ pub mod editor;
 pub mod frontmatter;
 pub mod notebook;
 pub mod structure;
+pub mod template;
 pub mod write;
