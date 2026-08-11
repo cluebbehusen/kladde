@@ -205,17 +205,22 @@ pub struct Guard<'a> {
 }
 
 impl Guard<'_> {
-    /// Reads the note's current contents; a missing note reads as empty,
-    /// so create-if-missing needs no separate step.
+    /// Reads the note's current contents and whether the note existed: a
+    /// missing note reads as `seed` (empty when there is none), so
+    /// create-if-missing and template seeding need no separate step. The
+    /// flag lets stamping tell a creation from an edit, which the
+    /// contents cannot once a seed carries frontmatter of its own.
     ///
     /// # Errors
     ///
     /// Returns an error when the note exists but cannot be read as UTF-8.
-    pub fn current(&self) -> Result<String, Error> {
+    pub fn current(&self, seed: Option<&str>) -> Result<(String, bool), Error> {
         let path = self.note.as_path();
         match fs::read_to_string(path) {
-            Ok(contents) => Ok(contents),
-            Err(cause) if cause.kind() == ErrorKind::NotFound => Ok(String::new()),
+            Ok(contents) => Ok((contents, true)),
+            Err(cause) if cause.kind() == ErrorKind::NotFound => {
+                Ok((seed.unwrap_or_default().to_owned(), false))
+            }
             Err(cause) => Err(Error::Read {
                 path: path.to_owned(),
                 cause,
@@ -272,21 +277,49 @@ impl Guard<'_> {
         Ok(())
     }
 
+    /// Creates the note from `seed` (empty when there is none), stamped
+    /// as a creation when `stamp` is given, with the usual atomic
+    /// replace, parent folders included. An existing note is already
+    /// created: success, untouched, whatever it holds — the note is
+    /// probed, never read, so even one that is not UTF-8 is a success.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the note cannot be written as
+    /// [`Self::replace`] reports.
+    pub fn create(
+        &self,
+        seed: Option<&str>,
+        stamp: Option<&frontmatter::Stamp<'_>>,
+    ) -> Result<(), Error> {
+        if self.note.as_path().exists() {
+            return Ok(());
+        }
+        let base = seed.unwrap_or_default();
+        let new = match stamp {
+            Some(stamp) => frontmatter::stamped(base, false, stamp),
+            None => base.to_owned(),
+        };
+        self.replace(&new)
+    }
+
     /// Appends `text` to the note as its own line, at the place `under`
     /// names as [`structure::inserted`] describes: the end of the note
     /// when it names none. The text is appended verbatim, so a bullet is
     /// whatever the caller types; trailing newlines on `text` are
     /// dropped and exactly one terminating newline is written. The note
-    /// is created (parent folders included) if it does not exist, except
-    /// that a placement can never match in a missing note, so it errors
-    /// before creating anything. Appends never disturb frontmatter: the
-    /// end of the file is below it, and a placement resolves in the body
-    /// alone.
+    /// is created (parent folders included) if it does not exist, and a
+    /// missing note starts from `seed`, so its first append can land
+    /// inside seeded structure. A placement can only match in a missing
+    /// note through the seed; without one it errors before creating
+    /// anything. Appends never disturb frontmatter: the end of the file
+    /// is below it, and a placement resolves in the body alone.
     ///
     /// With a `stamp`, the note is stamped as [`frontmatter::stamped`]
-    /// describes, in the same atomic write. The caller renders the
-    /// stamp's timestamp while already holding this guard, so stamps
-    /// record the serialized write order.
+    /// describes, in the same atomic write; a created note is stamped as
+    /// a creation even when its seed carries a frontmatter block. The
+    /// caller renders the stamp's timestamp while already holding this
+    /// guard, so stamps record the serialized write order.
     ///
     /// # Errors
     ///
@@ -297,6 +330,7 @@ impl Guard<'_> {
     pub fn append(
         &self,
         text: &str,
+        seed: Option<&str>,
         under: &structure::Placement,
         stamp: Option<&frontmatter::Stamp<'_>>,
     ) -> Result<(), Error> {
@@ -304,10 +338,10 @@ impl Guard<'_> {
         if text.is_empty() {
             return Err(Error::EmptyText);
         }
-        let current = self.current()?;
+        let (current, existed) = self.current(seed)?;
         let mut new = structure::inserted(&current, text, under)?;
         if let Some(stamp) = stamp {
-            let had_block = frontmatter::has_block(&current);
+            let had_block = existed && frontmatter::has_block(&current);
             new = frontmatter::stamped(&new, had_block, stamp);
         }
         self.replace(&new)
@@ -462,18 +496,39 @@ mod tests {
         let target = note(&root, "x.md");
         let lock = Lock::acquire(locks.path(), target.root()).expect("lock acquires");
         let guard = lock.guard(&target);
-        assert_eq!(guard.current().expect("read succeeds"), "");
+        assert_eq!(
+            guard.current(None).expect("read succeeds"),
+            (String::new(), false)
+        );
     }
 
     #[test]
-    fn current_reads_the_note() {
+    fn current_seeds_a_missing_note() {
+        let root = temp();
+        let locks = temp();
+        let target = note(&root, "x.md");
+        let lock = Lock::acquire(locks.path(), target.root()).expect("lock acquires");
+        let guard = lock.guard(&target);
+        assert_eq!(
+            guard.current(Some("# Seeded\n")).expect("read succeeds"),
+            ("# Seeded\n".to_owned(), false)
+        );
+    }
+
+    /// An existing note reads as itself: the seed is only what a missing
+    /// note starts from, never a replacement for real contents.
+    #[test]
+    fn current_reads_the_note_over_any_seed() {
         let root = temp();
         let locks = temp();
         fs::write(root.path().join("x.md"), "contents\n").expect("fixture writes");
         let target = note(&root, "x.md");
         let lock = Lock::acquire(locks.path(), target.root()).expect("lock acquires");
         let guard = lock.guard(&target);
-        assert_eq!(guard.current().expect("read succeeds"), "contents\n");
+        assert_eq!(
+            guard.current(Some("seed\n")).expect("read succeeds"),
+            ("contents\n".to_owned(), true)
+        );
     }
 
     #[test]
@@ -498,7 +553,7 @@ mod tests {
         Lock::acquire(locks.path(), target.root())
             .expect("lock acquires")
             .guard(&target)
-            .append("- first", &eof(), Some(&stamp))
+            .append("- first", None, &eof(), Some(&stamp))
             .expect("append succeeds");
         let contents = fs::read_to_string(target.as_path()).expect("note reads");
         assert_eq!(contents, "---\ncreated: T\nupdated: T\n---\n- first\n");
@@ -517,10 +572,109 @@ mod tests {
         Lock::acquire(locks.path(), target.root())
             .expect("lock acquires")
             .guard(&target)
-            .append("- entry", &placement, None)
+            .append("- entry", None, &placement, None)
             .expect("append succeeds");
         let contents = fs::read_to_string(target.as_path()).expect("note reads");
         assert_eq!(contents, "# A\nalpha\n- entry\n# B\nbeta\n");
+    }
+
+    /// Creation probes rather than reads, so an existing note is a
+    /// success whatever it holds, even bytes that are not UTF-8.
+    #[test]
+    fn create_leaves_an_existing_note_untouched() {
+        let root = temp();
+        let locks = temp();
+        fs::write(root.path().join("x.md"), b"keep \xFF\xFE").expect("fixture writes");
+        let target = note(&root, "x.md");
+        let stamp = frontmatter::Stamp::new("created", "updated", "T").expect("stamp validates");
+        Lock::acquire(locks.path(), target.root())
+            .expect("lock acquires")
+            .guard(&target)
+            .create(Some("seed\n"), Some(&stamp))
+            .expect("create succeeds");
+        let contents = fs::read(target.as_path()).expect("note reads");
+        assert_eq!(contents, b"keep \xFF\xFE");
+    }
+
+    #[test]
+    fn create_writes_a_stamped_seed() {
+        let root = temp();
+        let locks = temp();
+        let target = note(&root, "x.md");
+        let stamp = frontmatter::Stamp::new("created", "updated", "T").expect("stamp validates");
+        Lock::acquire(locks.path(), target.root())
+            .expect("lock acquires")
+            .guard(&target)
+            .create(Some("# Day\n"), Some(&stamp))
+            .expect("create succeeds");
+        let contents = fs::read_to_string(target.as_path()).expect("note reads");
+        assert_eq!(contents, "---\ncreated: T\nupdated: T\n---\n# Day\n");
+    }
+
+    #[test]
+    fn create_writes_an_empty_note_bare() {
+        let root = temp();
+        let locks = temp();
+        let target = note(&root, "sub/x.md");
+        Lock::acquire(locks.path(), target.root())
+            .expect("lock acquires")
+            .guard(&target)
+            .create(None, None)
+            .expect("create succeeds");
+        let contents = fs::read_to_string(target.as_path()).expect("note reads");
+        assert_eq!(contents, "");
+    }
+
+    /// A placement can match inside the seed of a missing note: the
+    /// note is created with the entry already placed in the seeded
+    /// structure.
+    #[test]
+    fn append_places_into_the_seed_of_a_missing_note() {
+        let root = temp();
+        let locks = temp();
+        let target = note(&root, "x.md");
+        let placement = structure::Placement {
+            headings: vec!["Log".to_owned()],
+            ..structure::Placement::default()
+        };
+        Lock::acquire(locks.path(), target.root())
+            .expect("lock acquires")
+            .guard(&target)
+            .append(
+                "- entry",
+                Some("# T\n\n## Log\n\n## Other\n"),
+                &placement,
+                None,
+            )
+            .expect("append succeeds");
+        let contents = fs::read_to_string(target.as_path()).expect("note reads");
+        assert_eq!(contents, "# T\n\n## Log\n- entry\n\n## Other\n");
+    }
+
+    /// A seed carrying frontmatter still stamps as a creation: the note
+    /// did not exist, so `created` is set, while a `created` the seed
+    /// spells itself survives as a manual value would.
+    #[test]
+    fn append_seeds_a_missing_note_and_stamps_a_creation() {
+        let root = temp();
+        let locks = temp();
+        let target = note(&root, "x.md");
+        let stamp = frontmatter::Stamp::new("created", "updated", "T").expect("stamp validates");
+        Lock::acquire(locks.path(), target.root())
+            .expect("lock acquires")
+            .guard(&target)
+            .append(
+                "- first",
+                Some("---\ntags: daily\n---\nBody\n"),
+                &eof(),
+                Some(&stamp),
+            )
+            .expect("append succeeds");
+        let contents = fs::read_to_string(target.as_path()).expect("note reads");
+        assert_eq!(
+            contents,
+            "---\ntags: daily\ncreated: T\nupdated: T\n---\nBody\n- first\n"
+        );
     }
 
     /// A placement can never match in a missing note, so the append
@@ -537,7 +691,7 @@ mod tests {
         let error = Lock::acquire(locks.path(), target.root())
             .expect("lock acquires")
             .guard(&target)
-            .append("- entry", &placement, None)
+            .append("- entry", None, &placement, None)
             .expect_err("unmatched placement fails");
         assert_eq!(error.to_string(), "no heading matching \"A\"");
         assert!(!target.as_path().exists());
@@ -559,7 +713,7 @@ mod tests {
         Lock::acquire(locks.path(), target.root())
             .expect("lock acquires")
             .guard(&target)
-            .append("- entry", &placement, Some(&stamp))
+            .append("- entry", None, &placement, Some(&stamp))
             .expect("append succeeds");
         let contents = fs::read_to_string(target.as_path()).expect("note reads");
         assert_eq!(
@@ -576,7 +730,7 @@ mod tests {
         Lock::acquire(locks.path(), target.root())
             .expect("lock acquires")
             .guard(&target)
-            .append("- first", &eof(), None)
+            .append("- first", None, &eof(), None)
             .expect("append succeeds");
         let contents = fs::read_to_string(target.as_path()).expect("note reads");
         assert_eq!(contents, "- first\n");
@@ -591,7 +745,7 @@ mod tests {
         Lock::acquire(locks.path(), target.root())
             .expect("lock acquires")
             .guard(&target)
-            .append("- next", &eof(), None)
+            .append("- next", None, &eof(), None)
             .expect("append succeeds");
         let contents = fs::read_to_string(target.as_path()).expect("note reads");
         assert_eq!(contents, "start\n- next\n");
@@ -606,7 +760,7 @@ mod tests {
         Lock::acquire(locks.path(), target.root())
             .expect("lock acquires")
             .guard(&target)
-            .append("- next", &eof(), None)
+            .append("- next", None, &eof(), None)
             .expect("append succeeds");
         let contents = fs::read_to_string(target.as_path()).expect("note reads");
         assert_eq!(contents, "no newline\n- next\n");
@@ -621,7 +775,7 @@ mod tests {
         Lock::acquire(locks.path(), target.root())
             .expect("lock acquires")
             .guard(&target)
-            .append("- only", &eof(), None)
+            .append("- only", None, &eof(), None)
             .expect("append succeeds");
         let contents = fs::read_to_string(target.as_path()).expect("note reads");
         assert_eq!(contents, "- only\n");
@@ -635,7 +789,7 @@ mod tests {
         Lock::acquire(locks.path(), target.root())
             .expect("lock acquires")
             .guard(&target)
-            .append("- parent\n\t- child", &eof(), None)
+            .append("- parent\n\t- child", None, &eof(), None)
             .expect("append succeeds");
         let contents = fs::read_to_string(target.as_path()).expect("note reads");
         assert_eq!(contents, "- parent\n\t- child\n");
@@ -649,7 +803,7 @@ mod tests {
         Lock::acquire(locks.path(), target.root())
             .expect("lock acquires")
             .guard(&target)
-            .append("- entry\r\n\n", &eof(), None)
+            .append("- entry\r\n\n", None, &eof(), None)
             .expect("append succeeds");
         let contents = fs::read_to_string(target.as_path()).expect("note reads");
         assert_eq!(contents, "- entry\n");
@@ -663,13 +817,13 @@ mod tests {
         let error = Lock::acquire(locks.path(), target.root())
             .expect("lock acquires")
             .guard(&target)
-            .append("", &eof(), None)
+            .append("", None, &eof(), None)
             .expect_err("empty text fails");
         assert!(error.to_string().contains("nothing to append"));
         Lock::acquire(locks.path(), target.root())
             .expect("lock acquires")
             .guard(&target)
-            .append("\n\n", &eof(), None)
+            .append("\n\n", None, &eof(), None)
             .expect_err("newline-only text fails");
         assert!(!target.as_path().exists());
     }
@@ -683,7 +837,7 @@ mod tests {
         let error = Lock::acquire(locks.path(), target.root())
             .expect("lock acquires")
             .guard(&target)
-            .append("- entry", &eof(), None)
+            .append("- entry", None, &eof(), None)
             .expect_err("bad encoding fails");
         assert!(error.to_string().contains("cannot read"));
     }
@@ -698,7 +852,7 @@ mod tests {
         Lock::acquire(locks.path(), target.root())
             .expect("lock acquires")
             .guard(&target)
-            .append("- entry", &eof(), None)
+            .append("- entry", None, &eof(), None)
             .expect("append succeeds");
         let contents = fs::read_to_string(target.as_path()).expect("note reads");
         assert_eq!(contents, "- entry\n");
@@ -715,7 +869,7 @@ mod tests {
         let error = Lock::acquire(locks.path(), target.root())
             .expect("lock acquires")
             .guard(&target)
-            .append("- entry", &eof(), None)
+            .append("- entry", None, &eof(), None)
             .expect_err("obstructed temp fails");
         assert!(error.to_string().contains("cannot write"));
     }
@@ -737,7 +891,7 @@ mod tests {
         Lock::acquire(locks.path(), target.root())
             .expect("lock acquires")
             .guard(&target)
-            .append("- entry", &eof(), None)
+            .append("- entry", None, &eof(), None)
             .expect("append succeeds");
         assert_eq!(
             fs::read_to_string(&precious).expect("outside file reads"),
@@ -784,7 +938,7 @@ mod tests {
         let error = Lock::acquire(locks.path(), target.root())
             .expect("lock acquires")
             .guard(&target)
-            .append("- entry", &eof(), None)
+            .append("- entry", None, &eof(), None)
             .expect_err("escaped folder fails");
         assert!(error.to_string().contains("escaped the notebook"));
         assert!(!outside.path().join("b.md").exists());
@@ -822,12 +976,12 @@ mod tests {
         Lock::acquire(locks.path(), note(&root, "x.md").root())
             .expect("lock acquires")
             .guard(&note(&root, "x.md"))
-            .append("- one", &eof(), None)
+            .append("- one", None, &eof(), None)
             .expect("append succeeds");
         Lock::acquire(locks.path(), note(&root, "y.md").root())
             .expect("lock acquires")
             .guard(&note(&root, "y.md"))
-            .append("- two", &eof(), None)
+            .append("- two", None, &eof(), None)
             .expect("append succeeds");
         let entries = fs::read_dir(locks.path()).expect("lock dir reads");
         assert_eq!(entries.count(), 1);
@@ -841,7 +995,7 @@ mod tests {
         let target = note(&root, "x.md");
         let lock = Lock::acquire(locks.path(), target.root()).expect("lock acquires");
         let guard = lock.guard(&target);
-        let current = guard.current().expect("read succeeds");
+        let (current, _) = guard.current(None).expect("read succeeds");
         guard
             .replace(&format!("{current} after"))
             .expect("replace succeeds");
@@ -862,7 +1016,7 @@ mod tests {
         Lock::acquire(locks.path(), target.root())
             .expect("lock acquires")
             .guard(&target)
-            .append("- entry", &eof(), None)
+            .append("- entry", None, &eof(), None)
             .expect("append succeeds");
         let mode = fs::metadata(&path)
             .expect("metadata reads")

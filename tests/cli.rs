@@ -45,6 +45,30 @@ fn kladde_unstamped(state: &Path, xdg: &Path) -> Command {
     command
 }
 
+/// A command against a config pointing at the notebook's daily template,
+/// unstamped so seeded writes stay byte-predictable.
+fn kladde_templated(state: &Path, xdg: &Path) -> Command {
+    write_config(
+        xdg,
+        "stamp = false\ndaily-template = 'templates/Daily.md'\n",
+    );
+    let mut command = kladde_state(state);
+    command.env("XDG_CONFIG_HOME", xdg);
+    command
+}
+
+/// Writes the daily template the templated config points at.
+fn write_template(nb: &TempDir, contents: &str) {
+    let folder = nb.path().join("templates");
+    fs::create_dir_all(&folder).expect("fixture dir creates");
+    fs::write(folder.join("Daily.md"), contents).expect("fixture writes");
+}
+
+/// The dated note the templated tests write.
+fn dated_contents(nb: &TempDir) -> String {
+    fs::read_to_string(nb.path().join("2026-01-05.md")).expect("note reads")
+}
+
 fn temp() -> TempDir {
     TempDir::new().expect("temp dir creates")
 }
@@ -72,7 +96,9 @@ fn set_readonly(path: &Path, readonly: bool) {
 /// Editors reachable without `PATH`, which the hermetic environment clears.
 /// The creating editor proves the target argument arrived by creating the
 /// file it is given; the success editor ignores its argument and exits 0;
-/// the failing editor exits unsuccessfully.
+/// the failing editor exits unsuccessfully. The Windows program paths are
+/// double-quoted — backslashes before letters stay literal inside shell
+/// double quotes — leaving the values embeddable in single-quoted TOML.
 #[cfg(not(windows))]
 fn creating_editor() -> String {
     "/usr/bin/touch".to_owned()
@@ -80,7 +106,7 @@ fn creating_editor() -> String {
 
 #[cfg(windows)]
 fn creating_editor() -> String {
-    format!("{}\\System32\\cmd.exe /C copy /Y NUL", systemroot())
+    format!("\"{}\\System32\\cmd.exe\" /C copy /Y NUL", systemroot())
 }
 
 #[cfg(not(windows))]
@@ -90,7 +116,7 @@ fn success_editor() -> String {
 
 #[cfg(windows)]
 fn success_editor() -> String {
-    format!("{}\\System32\\cmd.exe /C rem", systemroot())
+    format!("\"{}\\System32\\cmd.exe\" /C rem", systemroot())
 }
 
 /// `false` ignores its argument; `type` fails on the missing config file the
@@ -102,7 +128,25 @@ fn failing_editor() -> String {
 
 #[cfg(windows)]
 fn failing_editor() -> String {
-    format!("{}\\System32\\cmd.exe /C type", systemroot())
+    format!("\"{}\\System32\\cmd.exe\" /C type", systemroot())
+}
+
+/// A creating editor placed at a path containing a space, quoted the way
+/// the shell-words contract requires. Unix links rather than copies,
+/// because macOS kills a copied system binary.
+#[cfg(not(windows))]
+fn spaced_editor(dir: &Path) -> String {
+    let program = dir.join("my editor");
+    std::os::unix::fs::symlink("/usr/bin/touch", &program).expect("editor links");
+    format!("'{}'", program.display())
+}
+
+#[cfg(windows)]
+fn spaced_editor(dir: &Path) -> String {
+    let source = format!("{}\\System32\\cmd.exe", systemroot());
+    let program = dir.join("my editor.exe");
+    fs::copy(source, &program).expect("editor copies");
+    format!("\"{}\" /C copy /Y NUL", program.display())
 }
 
 #[cfg(windows)]
@@ -437,6 +481,28 @@ fn config_set_editor_rejects_blank_command() {
 }
 
 #[test]
+fn config_set_editor_rejects_an_unclosed_quote() {
+    let xdg = temp();
+    kladde_in(xdg.path())
+        .args(["config", "set", "editor", "'unclosed"])
+        .assert()
+        .code(1)
+        .stderr(contains("`editor`:"));
+    assert!(!config_file(xdg.path()).exists());
+}
+
+#[test]
+fn config_rejects_an_unparsable_editor() {
+    let xdg = temp();
+    write_config(xdg.path(), "editor = \"'unclosed\"\n");
+    kladde_in(xdg.path())
+        .args(["config", "get", "editor"])
+        .assert()
+        .code(1)
+        .stderr(contains("`editor`:"));
+}
+
+#[test]
 fn config_unset_removes_key() {
     let xdg = temp();
     let notebook = temp();
@@ -557,6 +623,30 @@ fn config_open_reports_editor_failure() {
         .assert()
         .code(1)
         .stderr(contains("failed"));
+}
+
+#[test]
+fn config_open_runs_a_quoted_editor_with_spaces() {
+    let xdg = temp();
+    let dir = xdg.path().join("space dir");
+    fs::create_dir(&dir).expect("dir creates");
+    kladde_in(xdg.path())
+        .env("VISUAL", spaced_editor(&dir))
+        .args(["config", "open"])
+        .assert()
+        .success();
+    assert!(config_file(xdg.path()).exists());
+}
+
+#[test]
+fn config_open_reports_an_unparsable_visual() {
+    let xdg = temp();
+    kladde_in(xdg.path())
+        .env("VISUAL", "'unclosed")
+        .args(["config", "open"])
+        .assert()
+        .code(1)
+        .stderr(contains("cannot parse editor command"));
 }
 
 #[test]
@@ -904,6 +994,521 @@ fn path_prints_non_unicode_target_bytes() {
     assert_eq!(assert.get_output().stdout, expected);
 }
 
+#[test]
+fn read_prints_the_note_verbatim() {
+    let nb = temp();
+    fs::write(nb.path().join("x.md"), "# T\n\nbody\n").expect("fixture writes");
+    kladde()
+        .args(["read", "x.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success()
+        .stdout("# T\n\nbody\n");
+}
+
+#[test]
+fn read_prints_a_note_without_trailing_newline() {
+    let nb = temp();
+    fs::write(nb.path().join("x.md"), "no newline").expect("fixture writes");
+    kladde()
+        .args(["read", "x.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success()
+        .stdout("no newline");
+}
+
+/// A missing note is an error, unlike the empty note it reads the same
+/// as elsewhere: an empty note prints nothing and succeeds.
+#[test]
+fn read_tells_an_empty_note_from_a_missing_one() {
+    let nb = temp();
+    fs::write(nb.path().join("empty.md"), "").expect("fixture writes");
+    kladde()
+        .args(["read", "empty.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success()
+        .stdout("");
+    kladde()
+        .args(["read", "missing.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .code(1)
+        .stderr(contains("cannot read"));
+}
+
+#[test]
+fn read_reports_an_unreadable_note() {
+    let nb = temp();
+    fs::write(nb.path().join("x.md"), b"\xFF\xFE").expect("fixture writes");
+    kladde()
+        .args(["read", "x.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .code(1)
+        .stderr(contains("cannot read"));
+}
+
+/// A reader that stops early — the `| head` shape — closes the pipe
+/// while the note is still going through it; the broken pipe is the
+/// reader's call, so the process ends quietly as a success. The note is
+/// larger than the pipe buffer, so the write is mid-stream when the
+/// reader disappears. Unix only: a Windows write succeeds even with the
+/// pipe's read end closed, so the scenario cannot be produced there.
+#[cfg(unix)]
+#[test]
+fn read_exits_cleanly_when_the_reader_stops_early() {
+    let nb = temp();
+    fs::write(nb.path().join("big.md"), "x".repeat(4 * 1024 * 1024)).expect("fixture writes");
+    let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin("kladde"));
+    command.env_clear();
+    for key in ["LLVM_PROFILE_FILE", "SYSTEMROOT"] {
+        if let Ok(value) = std::env::var(key) {
+            command.env(key, value);
+        }
+    }
+    let mut child = command
+        .args(["read", "big.md", "--notebook"])
+        .arg(nb.path())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .expect("binary spawns");
+    drop(child.stdout.take());
+    let status = child.wait().expect("child waits");
+    assert!(status.success(), "{status}");
+}
+
+#[test]
+fn read_resolves_a_name() {
+    let nb = temp();
+    fs::create_dir(nb.path().join("sub")).expect("fixture dir creates");
+    fs::write(nb.path().join("sub").join("Topic.md"), "found\n").expect("fixture writes");
+    kladde()
+        .args(["read", "--name", "topic", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success()
+        .stdout("found\n");
+}
+
+#[test]
+fn read_resolves_a_date() {
+    let nb = temp();
+    fs::write(nb.path().join("2026-01-05.md"), "that day\n").expect("fixture writes");
+    kladde()
+        .args(["read", "--date", "2026-01-05", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success()
+        .stdout("that day\n");
+}
+
+#[test]
+fn read_reports_an_ambiguous_name() {
+    let nb = temp();
+    fs::create_dir(nb.path().join("sub")).expect("fixture dir creates");
+    fs::write(nb.path().join("a.md"), "").expect("fixture writes");
+    fs::write(nb.path().join("sub").join("a.md"), "").expect("fixture writes");
+    kladde()
+        .args(["read", "--name", "a", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .code(1)
+        .stderr(contains("multiple notes named"));
+}
+
+#[test]
+fn list_prints_sorted_relative_paths() {
+    let nb = temp();
+    fs::write(nb.path().join("b.md"), "").expect("fixture writes");
+    fs::write(nb.path().join("a.md"), "").expect("fixture writes");
+    fs::write(nb.path().join(".hidden.md"), "").expect("fixture writes");
+    fs::write(nb.path().join("plain.txt"), "").expect("fixture writes");
+    fs::create_dir(nb.path().join("sub")).expect("fixture dir creates");
+    fs::write(nb.path().join("sub").join("c.md"), "").expect("fixture writes");
+    kladde()
+        .args(["list", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success()
+        .stdout(format!(
+            "a.md\nb.md\n{}\n",
+            Path::new("sub").join("c.md").display()
+        ));
+}
+
+#[test]
+fn list_succeeds_on_an_empty_notebook() {
+    let nb = temp();
+    kladde()
+        .args(["list", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success()
+        .stdout("");
+}
+
+#[test]
+fn list_errors_without_any_notebook() {
+    kladde()
+        .arg("list")
+        .assert()
+        .code(1)
+        .stderr(contains("cannot locate the config directory"));
+}
+
+/// Only Unix lets a file name hold a line break; such a name would let
+/// one note print as several, so the listing refuses loudly with
+/// nothing on stdout.
+#[cfg(unix)]
+#[test]
+fn list_refuses_a_note_name_with_a_line_break() {
+    let nb = temp();
+    fs::write(nb.path().join("a.md"), "").expect("fixture writes");
+    fs::write(nb.path().join("evil\nx.md"), "").expect("fixture writes");
+    kladde()
+        .args(["list", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .code(1)
+        .stdout("")
+        .stderr(contains("contains a line break"));
+}
+
+/// Search shares the listing refusal wherever the name sits, matched or
+/// not: a forged-looking result is worse than a failed one.
+#[cfg(unix)]
+#[test]
+fn search_refuses_a_note_name_with_a_line_break() {
+    let nb = temp();
+    fs::write(nb.path().join("a.md"), "alpha match\n").expect("fixture writes");
+    fs::write(nb.path().join("evil\nx.md"), "gamma\n").expect("fixture writes");
+    kladde()
+        .args(["search", "alpha", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .code(1)
+        .stdout("")
+        .stderr(contains("contains a line break"));
+}
+
+#[cfg(unix)]
+#[test]
+fn list_reports_an_unreadable_folder() {
+    let nb = temp();
+    let sub = nb.path().join("sub");
+    fs::create_dir(&sub).expect("fixture dir creates");
+    set_mode(&sub, 0o000);
+    kladde()
+        .args(["list", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .code(1)
+        .stderr(contains("cannot resolve"));
+    set_mode(&sub, 0o755);
+}
+
+#[test]
+fn search_prints_matching_notes() {
+    let nb = temp();
+    fs::write(nb.path().join("b.md"), "the beta row\n").expect("fixture writes");
+    fs::write(nb.path().join("a.md"), "Alpha and BETA\n").expect("fixture writes");
+    fs::write(nb.path().join("c.md"), "gamma\n").expect("fixture writes");
+    kladde()
+        .args(["search", "beta", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success()
+        .stdout("a.md\nb.md\n");
+}
+
+#[test]
+fn search_is_case_insensitive_both_ways() {
+    let nb = temp();
+    fs::write(nb.path().join("x.md"), "MiXeD CaSe\n").expect("fixture writes");
+    kladde()
+        .args(["search", "mixed case", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success()
+        .stdout("x.md\n");
+    kladde()
+        .args(["search", "MIXED CASE", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success()
+        .stdout("x.md\n");
+}
+
+/// Search folds like name lookup: full Unicode case folding, so
+/// spellings that differ by letter count still match in both
+/// directions.
+#[test]
+fn search_folds_case_like_name_lookup() {
+    let nb = temp();
+    fs::write(nb.path().join("x.md"), "die Stra\u{df}e bei Nacht\n").expect("fixture writes");
+    fs::write(nb.path().join("y.md"), "LOUD STRASSE HERE\n").expect("fixture writes");
+    kladde()
+        .args(["search", "STRASSE", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success()
+        .stdout("x.md\ny.md\n");
+    kladde()
+        .args(["search", "stra\u{df}e", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success()
+        .stdout("x.md\ny.md\n");
+}
+
+#[test]
+fn search_exits_one_without_matches() {
+    let nb = temp();
+    fs::write(nb.path().join("x.md"), "alpha\n").expect("fixture writes");
+    kladde()
+        .args(["search", "zeta", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .code(1)
+        .stdout("");
+}
+
+#[test]
+fn search_rejects_an_empty_query() {
+    let nb = temp();
+    kladde()
+        .args(["search", "", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .code(1)
+        .stderr(contains("the query is empty"));
+}
+
+#[test]
+fn search_accepts_hyphen_queries() {
+    let nb = temp();
+    fs::write(nb.path().join("x.md"), "uses --notebook and -q\n").expect("fixture writes");
+    kladde()
+        .args(["search", "-q", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success()
+        .stdout("x.md\n");
+    kladde()
+        .args(["search", "--notebook"])
+        .arg(nb.path())
+        .args(["--", "--notebook"])
+        .assert()
+        .success()
+        .stdout("x.md\n");
+}
+
+/// A read failure fails the whole search with nothing on stdout, even
+/// when an earlier note already matched: a partial result would look
+/// complete, and the failure exit code is also the no-match one.
+#[test]
+fn search_reports_an_unreadable_note() {
+    let nb = temp();
+    fs::write(nb.path().join("a.md"), "alpha match\n").expect("fixture writes");
+    fs::write(nb.path().join("bad.md"), b"\xFF\xFE").expect("fixture writes");
+    kladde()
+        .args(["search", "alpha", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .code(1)
+        .stdout("")
+        .stderr(contains("cannot read"));
+}
+
+#[test]
+fn search_errors_without_any_notebook() {
+    kladde()
+        .args(["search", "alpha"])
+        .assert()
+        .code(1)
+        .stderr(contains("cannot locate the config directory"));
+}
+
+#[cfg(unix)]
+#[test]
+fn search_reports_an_unreadable_folder() {
+    let nb = temp();
+    let sub = nb.path().join("sub");
+    fs::create_dir(&sub).expect("fixture dir creates");
+    set_mode(&sub, 0o000);
+    kladde()
+        .args(["search", "alpha", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .code(1)
+        .stderr(contains("cannot resolve"));
+    set_mode(&sub, 0o755);
+}
+
+#[test]
+fn open_runs_the_configured_editor_on_the_note() {
+    let xdg = temp();
+    let nb = temp();
+    write_config(xdg.path(), &format!("editor = '{}'\n", creating_editor()));
+    kladde_in(xdg.path())
+        .args(["open", "x.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success();
+    assert!(nb.path().join("x.md").exists());
+}
+
+/// The success editor ignores its argument, so the missing note stays
+/// missing: `open` itself never creates anything.
+#[test]
+fn open_never_creates_the_note() {
+    let xdg = temp();
+    let nb = temp();
+    write_config(xdg.path(), &format!("editor = '{}'\n", success_editor()));
+    kladde_in(xdg.path())
+        .args(["open", "x.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success();
+    assert!(!nb.path().join("x.md").exists());
+}
+
+#[test]
+fn open_falls_back_to_visual() {
+    let nb = temp();
+    kladde()
+        .env("VISUAL", creating_editor())
+        .args(["open", "x.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success();
+    assert!(nb.path().join("x.md").exists());
+}
+
+#[test]
+fn open_falls_back_to_editor_env() {
+    let nb = temp();
+    kladde()
+        .env("EDITOR", creating_editor())
+        .args(["open", "x.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success();
+    assert!(nb.path().join("x.md").exists());
+}
+
+#[test]
+fn open_skips_blank_visual() {
+    let nb = temp();
+    kladde()
+        .env("VISUAL", "   ")
+        .env("EDITOR", creating_editor())
+        .args(["open", "x.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success();
+    assert!(nb.path().join("x.md").exists());
+}
+
+/// A VISUAL that parses to no program is as unset as a blank one: the
+/// chain falls through instead of trying to spawn an empty editor.
+#[test]
+fn open_skips_a_quoted_empty_visual() {
+    let nb = temp();
+    kladde()
+        .env("VISUAL", "''")
+        .env("EDITOR", creating_editor())
+        .args(["open", "x.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success();
+    assert!(nb.path().join("x.md").exists());
+}
+
+#[test]
+fn open_resolves_a_name() {
+    let nb = temp();
+    fs::create_dir(nb.path().join("sub")).expect("fixture dir creates");
+    fs::write(nb.path().join("sub").join("Topic.md"), "found\n").expect("fixture writes");
+    kladde()
+        .env("VISUAL", success_editor())
+        .args(["open", "--name", "topic", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success();
+}
+
+#[test]
+fn open_resolves_a_daily_note() {
+    let nb = temp();
+    kladde()
+        .env("VISUAL", creating_editor())
+        .args(["open", "--date", "2026-01-05", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success();
+    assert!(nb.path().join("2026-01-05.md").exists());
+}
+
+#[test]
+fn open_prefers_config_editor() {
+    let xdg = temp();
+    let nb = temp();
+    write_config(xdg.path(), &format!("editor = '{}'\n", success_editor()));
+    kladde_in(xdg.path())
+        .env("VISUAL", nb.path().join("no-such-editor"))
+        .args(["open", "x.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success();
+}
+
+#[test]
+fn open_errors_without_editor() {
+    let nb = temp();
+    kladde()
+        .args(["open", "x.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .code(1)
+        .stderr(contains("no editor configured"));
+}
+
+#[test]
+fn open_reports_editor_failure() {
+    let nb = temp();
+    kladde()
+        .env("VISUAL", failing_editor())
+        .args(["open", "x.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .code(1)
+        .stderr(contains("failed"));
+}
+
+/// `open` needs the config for the daily keys and the editor, so a
+/// broken config is an error here, while `path` keeps working with an
+/// explicit `--notebook`.
+#[test]
+fn open_reports_broken_config_where_path_succeeds() {
+    let xdg = temp();
+    let nb = temp();
+    write_config(xdg.path(), "editor = [oops\n");
+    kladde_in(xdg.path())
+        .args(["open", "x.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .code(1)
+        .stderr(contains("invalid TOML"));
+    kladde_in(xdg.path())
+        .args(["path", "x.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success();
+}
+
 fn utc_today() -> jiff::civil::Date {
     jiff::Timestamp::now()
         .to_zoned(jiff::tz::TimeZone::UTC)
@@ -1030,6 +1635,16 @@ fn config_set_daily_date_format_rejects_empty_value() {
 }
 
 #[test]
+fn config_set_daily_date_format_rejects_a_line_break() {
+    let xdg = temp();
+    kladde_in(xdg.path())
+        .args(["config", "set", "daily-date-format", "%Y%n"])
+        .assert()
+        .code(1)
+        .stderr(contains("renders a line break into a file name"));
+}
+
+#[test]
 fn config_unset_daily_keys() {
     let xdg = temp();
     write_config(
@@ -1048,6 +1663,557 @@ fn config_unset_daily_keys() {
         .args(["config", "get", "daily-folder"])
         .assert()
         .code(1);
+}
+
+#[test]
+fn config_daily_template_round_trips() {
+    let xdg = temp();
+    kladde_in(xdg.path())
+        .args(["config", "get", "daily-template"])
+        .assert()
+        .code(1)
+        .stdout("");
+    kladde_in(xdg.path())
+        .args(["config", "set", "daily-template", "templates/Daily.md"])
+        .assert()
+        .success();
+    kladde_in(xdg.path())
+        .args(["config", "get", "daily-template"])
+        .assert()
+        .success()
+        .stdout("templates/Daily.md\n");
+    kladde_in(xdg.path())
+        .args(["config", "unset", "daily-template"])
+        .assert()
+        .success();
+    kladde_in(xdg.path())
+        .args(["config", "get", "daily-template"])
+        .assert()
+        .code(1)
+        .stdout("");
+}
+
+#[test]
+fn config_rejects_a_bad_daily_template() {
+    let xdg = temp();
+    kladde_in(xdg.path())
+        .args(["config", "set", "daily-template", ""])
+        .assert()
+        .code(1)
+        .stderr(contains("`daily-template` must not be empty"));
+    kladde_in(xdg.path())
+        .args(["config", "set", "daily-template", "/rooted.md"])
+        .assert()
+        .code(1)
+        .stderr(contains("`daily-template` must be a relative path"));
+    assert!(!config_file(xdg.path()).exists());
+    let cases = [
+        ("daily-template = 3\n", "`daily-template` must be a string"),
+        (
+            "daily-template = ''\n",
+            "`daily-template` must not be empty",
+        ),
+        (
+            "daily-template = '/rooted.md'\n",
+            "`daily-template` must be a relative path",
+        ),
+    ];
+    for (contents, fragment) in cases {
+        write_config(xdg.path(), contents);
+        kladde_in(xdg.path())
+            .args(["config", "get", "daily-template"])
+            .assert()
+            .code(1)
+            .stderr(contains(fragment));
+    }
+}
+
+#[test]
+fn append_seeds_a_missing_daily_from_the_template() {
+    let (nb, state, xdg) = (temp(), temp(), temp());
+    write_template(&nb, "# {{title}}\n\n## Log\n");
+    kladde_templated(state.path(), xdg.path())
+        .args(["append", "- entry", "--date", "2026-01-05", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success();
+    assert_eq!(dated_contents(&nb), "# 2026-01-05\n\n## Log\n- entry\n");
+}
+
+/// The whole point of seeding: the first append of the day can land
+/// under a heading that only exists in the template.
+#[test]
+fn append_under_places_into_the_daily_template() {
+    let (nb, state, xdg) = (temp(), temp(), temp());
+    write_template(&nb, "# {{title}}\n\n## Log\n\n## Other\n\nx\n");
+    kladde_templated(state.path(), xdg.path())
+        .args([
+            "append",
+            "- entry",
+            "--under",
+            "Log",
+            "--date",
+            "2026-01-05",
+            "--notebook",
+        ])
+        .arg(nb.path())
+        .assert()
+        .success();
+    assert_eq!(
+        dated_contents(&nb),
+        "# 2026-01-05\n\n## Log\n- entry\n\n## Other\n\nx\n"
+    );
+}
+
+/// Every variable shape runs through the CLI; the clock-dependent parts
+/// are asserted by shape, since only unit tests can pick the time.
+#[test]
+fn append_renders_every_template_variable() {
+    let (nb, state, xdg) = (temp(), temp(), temp());
+    write_template(
+        &nb,
+        "t={{title}}\nd={{date}}\nc={{date:dddd, MMMM D, YYYY [at] h:mm A}}\ne={{date:YY MMM M ddd}}\nf={{time:H hh m ss s a}}\nu={{tags}}\nw={{time}}\n",
+    );
+    kladde_templated(state.path(), xdg.path())
+        .args(["append", "- entry", "--date", "2026-01-05", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success();
+    let note = dated_contents(&nb);
+    assert!(note.contains("t=2026-01-05\n"), "in {note}");
+    assert!(note.contains("d=2026-01-05\n"), "in {note}");
+    assert!(note.contains("e=26 Jan 1 Mon\n"), "in {note}");
+    assert!(note.contains("u={{tags}}\n"), "in {note}");
+    let clock = note
+        .lines()
+        .find_map(|line| line.strip_prefix("c="))
+        .expect("clock line renders");
+    assert!(clock.starts_with("Monday, January 5, 2026 at "), "{clock}");
+    assert!(clock.ends_with('M'), "{clock}");
+    let parts: Vec<&str> = note
+        .lines()
+        .find_map(|line| line.strip_prefix("f="))
+        .expect("token line renders")
+        .split(' ')
+        .collect();
+    assert_eq!(parts.len(), 6, "in {note}");
+    assert!(
+        parts[..5]
+            .iter()
+            .all(|part| part.chars().all(|character| character.is_ascii_digit())),
+        "in {note}"
+    );
+    assert_eq!(parts[1].len(), 2, "in {note}");
+    assert_eq!(parts[3].len(), 2, "in {note}");
+    assert!(parts[5] == "am" || parts[5] == "pm", "in {note}");
+    let time = note
+        .lines()
+        .find_map(|line| line.strip_prefix("w="))
+        .expect("time line renders");
+    assert_eq!(time.len(), 5, "{time}");
+    assert!(
+        time.chars()
+            .enumerate()
+            .all(|(place, character)| if place == 2 {
+                character == ':'
+            } else {
+                character.is_ascii_digit()
+            }),
+        "{time}"
+    );
+    assert!(note.ends_with("- entry\n"), "in {note}");
+}
+
+#[test]
+fn append_with_a_broken_template_fails_to_create_a_daily() {
+    let (nb, state, xdg) = (temp(), temp(), temp());
+    kladde_templated(state.path(), xdg.path())
+        .args(["append", "- entry", "--date", "2026-01-05", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .code(1)
+        .stderr(contains("cannot read template"));
+    assert!(!nb.path().join("2026-01-05.md").exists());
+}
+
+#[test]
+fn append_with_a_broken_template_still_appends_to_an_existing_daily() {
+    let (nb, state, xdg) = (temp(), temp(), temp());
+    fs::write(nb.path().join("2026-01-05.md"), "old\n").expect("fixture writes");
+    kladde_templated(state.path(), xdg.path())
+        .args(["append", "- entry", "--date", "2026-01-05", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success();
+    assert_eq!(dated_contents(&nb), "old\n- entry\n");
+}
+
+#[test]
+fn append_reports_a_template_outside_the_notebook() {
+    let (nb, state, xdg) = (temp(), temp(), temp());
+    write_config(
+        xdg.path(),
+        "stamp = false\ndaily-template = '../escape.md'\n",
+    );
+    kladde_state(state.path())
+        .env("XDG_CONFIG_HOME", xdg.path())
+        .args(["append", "- entry", "--date", "2026-01-05", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .code(1)
+        .stderr(contains("cannot leave the notebook"));
+    assert!(!nb.path().join("2026-01-05.md").exists());
+}
+
+#[test]
+fn append_reports_a_template_with_an_unsupported_token() {
+    let (nb, state, xdg) = (temp(), temp(), temp());
+    write_template(&nb, "{{date:Q}}\n");
+    kladde_templated(state.path(), xdg.path())
+        .args(["append", "- entry", "--date", "2026-01-05", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .code(1)
+        .stderr(contains("unsupported token"));
+    assert!(!nb.path().join("2026-01-05.md").exists());
+}
+
+#[test]
+fn append_reports_a_template_with_an_unclosed_bracket() {
+    let (nb, state, xdg) = (temp(), temp(), temp());
+    write_template(&nb, "{{date:[oops}}\n");
+    kladde_templated(state.path(), xdg.path())
+        .args(["append", "- entry", "--date", "2026-01-05", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .code(1)
+        .stderr(contains("unclosed '['"));
+    assert!(!nb.path().join("2026-01-05.md").exists());
+}
+
+/// A template carrying frontmatter still stamps as a creation: the
+/// template's own properties survive and created/updated are added.
+#[test]
+fn append_stamps_a_seeded_daily_as_a_creation() {
+    let (nb, state, xdg) = (temp(), temp(), temp());
+    write_template(&nb, "---\ntags: daily\n---\nBody\n");
+    write_config(xdg.path(), "daily-template = 'templates/Daily.md'\n");
+    kladde_state(state.path())
+        .env("XDG_CONFIG_HOME", xdg.path())
+        .args(["append", "- entry", "--date", "2026-01-05", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success();
+    let note = dated_contents(&nb);
+    assert!(note.contains("tags: daily\n"), "in {note}");
+    assert!(note.contains("\ncreated: "), "in {note}");
+    assert!(note.contains("\nupdated: "), "in {note}");
+    assert!(note.ends_with("Body\n- entry\n"), "in {note}");
+}
+
+#[test]
+fn frontmatter_set_seeds_a_missing_templated_daily() {
+    let (nb, state, xdg) = (temp(), temp(), temp());
+    write_template(&nb, "# {{title}}\n");
+    kladde_templated(state.path(), xdg.path())
+        .args([
+            "frontmatter",
+            "set",
+            "topic",
+            "seeds",
+            "--date",
+            "2026-01-05",
+            "--notebook",
+        ])
+        .arg(nb.path())
+        .assert()
+        .success();
+    assert_eq!(
+        dated_contents(&nb),
+        "---\ntopic: seeds\n---\n# 2026-01-05\n"
+    );
+}
+
+/// A set the template already satisfies still creates the note: the
+/// command's outcome is a readable property, which needs the note to
+/// exist, so the seed is written rather than skipped.
+#[test]
+fn frontmatter_set_satisfied_by_the_template_still_creates() {
+    let (nb, state, xdg) = (temp(), temp(), temp());
+    write_template(&nb, "---\ntopic: seeds\n---\nBody\n");
+    kladde_templated(state.path(), xdg.path())
+        .args([
+            "frontmatter",
+            "set",
+            "topic",
+            "seeds",
+            "--date",
+            "2026-01-05",
+            "--notebook",
+        ])
+        .arg(nb.path())
+        .assert()
+        .success();
+    assert_eq!(dated_contents(&nb), "---\ntopic: seeds\n---\nBody\n");
+    kladde_templated(state.path(), xdg.path())
+        .args([
+            "frontmatter",
+            "get",
+            "topic",
+            "--date",
+            "2026-01-05",
+            "--notebook",
+        ])
+        .arg(nb.path())
+        .assert()
+        .success()
+        .stdout("seeds\n");
+}
+
+/// The add twin of the satisfied-set case: an item the template's list
+/// already holds still creates the note.
+#[test]
+fn frontmatter_add_satisfied_by_the_template_still_creates() {
+    let (nb, state, xdg) = (temp(), temp(), temp());
+    write_template(&nb, "---\ntags:\n  - daily\n---\n");
+    kladde_templated(state.path(), xdg.path())
+        .args([
+            "frontmatter",
+            "add",
+            "tags",
+            "daily",
+            "--date",
+            "2026-01-05",
+            "--notebook",
+        ])
+        .arg(nb.path())
+        .assert()
+        .success();
+    assert_eq!(dated_contents(&nb), "---\ntags:\n  - daily\n---\n");
+}
+
+#[test]
+fn frontmatter_set_with_a_broken_template_fails_to_create_a_daily() {
+    let (nb, state, xdg) = (temp(), temp(), temp());
+    kladde_templated(state.path(), xdg.path())
+        .args([
+            "frontmatter",
+            "set",
+            "topic",
+            "seeds",
+            "--date",
+            "2026-01-05",
+            "--notebook",
+        ])
+        .arg(nb.path())
+        .assert()
+        .code(1)
+        .stderr(contains("cannot read template"));
+    assert!(!nb.path().join("2026-01-05.md").exists());
+}
+
+/// An idempotent edit cannot create a note, seeded or not: removing a
+/// property the template does not hold changes nothing, so nothing is
+/// written.
+#[test]
+fn frontmatter_unset_on_a_missing_templated_daily_creates_nothing() {
+    let (nb, state, xdg) = (temp(), temp(), temp());
+    write_template(&nb, "# {{title}}\n");
+    kladde_templated(state.path(), xdg.path())
+        .args([
+            "frontmatter",
+            "unset",
+            "topic",
+            "--date",
+            "2026-01-05",
+            "--notebook",
+        ])
+        .arg(nb.path())
+        .assert()
+        .success();
+    assert!(!nb.path().join("2026-01-05.md").exists());
+}
+
+/// Seeding belongs to daily resolution: the same note addressed by its
+/// explicit path starts empty, template or not.
+#[test]
+fn append_to_an_explicit_path_does_not_seed() {
+    let (nb, state, xdg) = (temp(), temp(), temp());
+    write_template(&nb, "# {{title}}\n");
+    kladde_templated(state.path(), xdg.path())
+        .args(["append", "- entry", "2026-01-05.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success();
+    assert_eq!(dated_contents(&nb), "- entry\n");
+}
+
+#[test]
+fn new_creates_a_daily_from_the_template() {
+    let (nb, state, xdg) = (temp(), temp(), temp());
+    write_template(&nb, "# {{title}}\n\n## Log\n");
+    let assert = kladde_templated(state.path(), xdg.path())
+        .args(["new", "--date", "2026-01-05", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success();
+    assert_eq!(dated_contents(&nb), "# 2026-01-05\n\n## Log\n");
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("stdout is UTF-8");
+    assert!(stdout.ends_with("2026-01-05.md\n"), "{stdout}");
+}
+
+#[test]
+fn new_creates_an_empty_note_with_stamps() {
+    let nb = temp();
+    let state = temp();
+    kladde_state(state.path())
+        .args(["new", "sub/x.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success();
+    let contents = fs::read_to_string(nb.path().join("sub").join("x.md")).expect("note reads");
+    assert!(contents.starts_with("---\ncreated: "), "{contents}");
+    assert!(contents.contains("\nupdated: "), "{contents}");
+}
+
+#[test]
+fn new_unstamped_creates_a_bare_note() {
+    let (nb, state, xdg) = (temp(), temp(), temp());
+    kladde_unstamped(state.path(), xdg.path())
+        .args(["new", "x.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success();
+    assert_eq!(x_contents(&nb), "");
+}
+
+#[test]
+fn new_succeeds_on_an_existing_note_untouched() {
+    let nb = temp();
+    let state = temp();
+    fs::write(nb.path().join("x.md"), "keep\n").expect("fixture writes");
+    kladde_state(state.path())
+        .args(["new", "x.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success();
+    assert_eq!(x_contents(&nb), "keep\n");
+}
+
+#[test]
+fn new_rejects_a_name_target() {
+    let nb = temp();
+    kladde()
+        .args(["new", "--name", "x", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .code(2)
+        .stderr(contains("unexpected argument"));
+}
+
+#[test]
+fn new_errors_without_a_state_directory() {
+    let nb = temp();
+    kladde()
+        .args(["new", "x.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .code(1)
+        .stderr(contains("cannot locate the state directory"));
+}
+
+#[test]
+fn new_reports_a_broken_config() {
+    let (nb, state, xdg) = (temp(), temp(), temp());
+    write_config(xdg.path(), "editor = [oops\n");
+    kladde_state(state.path())
+        .env("XDG_CONFIG_HOME", xdg.path())
+        .args(["new", "x.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .code(1)
+        .stderr(contains("invalid TOML"));
+}
+
+#[test]
+fn new_reports_an_obstructed_temp_path() {
+    let nb = temp();
+    let state = temp();
+    fs::create_dir(nb.path().join(TEMP_X)).expect("fixture dir creates");
+    kladde_state(state.path())
+        .args(["new", "x.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .code(1)
+        .stderr(contains("cannot write"));
+}
+
+#[test]
+fn new_with_a_broken_template_creates_nothing() {
+    let (nb, state, xdg) = (temp(), temp(), temp());
+    kladde_templated(state.path(), xdg.path())
+        .args(["new", "--date", "2026-01-05", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .code(1)
+        .stderr(contains("cannot read template"));
+    assert!(!nb.path().join("2026-01-05.md").exists());
+}
+
+/// The create-if-missing race with a template: whoever wins the lock
+/// seeds, everyone else appends into the seeded note, and the template
+/// head appears exactly once.
+#[test]
+fn append_concurrent_writers_seed_one_template() {
+    const WRITERS: usize = 8;
+    let (nb, state, xdg) = (temp(), temp(), temp());
+    write_template(&nb, "# Day\n\n## Log\n");
+    write_config(
+        xdg.path(),
+        "stamp = false\ndaily-template = 'templates/Daily.md'\n",
+    );
+    let barrier = std::sync::Barrier::new(WRITERS);
+    std::thread::scope(|scope| {
+        for writer in 0..WRITERS {
+            let (barrier, nb, state, xdg) = (&barrier, nb.path(), state.path(), xdg.path());
+            scope.spawn(move || {
+                barrier.wait();
+                kladde_state(state)
+                    .env("XDG_CONFIG_HOME", xdg)
+                    .args([
+                        "append",
+                        &format!("- w{writer}"),
+                        "--under",
+                        "Log",
+                        "--date",
+                        "2026-01-05",
+                        "--notebook",
+                    ])
+                    .arg(nb)
+                    .assert()
+                    .success();
+            });
+        }
+    });
+    let contents = dated_contents(&nb);
+    assert_eq!(
+        contents.lines().filter(|line| *line == "# Day").count(),
+        1,
+        "in {contents}"
+    );
+    assert_eq!(
+        contents.lines().filter(|line| *line == "## Log").count(),
+        1,
+        "in {contents}"
+    );
+    let entries: std::collections::HashSet<&str> = contents
+        .lines()
+        .filter(|line| line.starts_with("- w"))
+        .collect();
+    assert_eq!(entries.len(), WRITERS, "in {contents}");
+    for writer in 0..WRITERS {
+        assert!(entries.contains(format!("- w{writer}").as_str()));
+    }
 }
 
 #[test]

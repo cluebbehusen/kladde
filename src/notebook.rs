@@ -259,9 +259,11 @@ impl Notebook {
         if stem.is_empty() {
             return Err(Error::EmptyTarget);
         }
-        let mut matches = Vec::new();
-        walk(&self.root, Path::new(""), stem, &mut matches)?;
-        matches.sort();
+        let mut matches: Vec<PathBuf> = self
+            .notes()?
+            .into_iter()
+            .filter(|path| has_stem(path, stem))
+            .collect();
         if matches.len() > 1 {
             return Err(Error::AmbiguousName {
                 name: stem.to_owned(),
@@ -278,12 +280,26 @@ impl Notebook {
             }),
         }
     }
+
+    /// The notebook-relative paths of every note, sorted. Folders and
+    /// files whose names start with a dot are skipped, and links are
+    /// neither followed nor listed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a folder cannot be read while walking.
+    pub fn notes(&self) -> Result<Vec<PathBuf>, Error> {
+        let mut notes = Vec::new();
+        walk(&self.root, Path::new(""), &mut notes)?;
+        notes.sort();
+        Ok(notes)
+    }
 }
 
-/// Collects the notebook-relative paths of `.md` files under `dir` whose
-/// stem matches `wanted` case-insensitively. Recurses only into real
-/// directories, so links are skipped, and skips dot-prefixed entries.
-fn walk(dir: &Path, rel: &Path, wanted: &str, matches: &mut Vec<PathBuf>) -> Result<(), Error> {
+/// Collects the notebook-relative paths of `.md` files under `dir`.
+/// Recurses only into real directories, so links are skipped, and skips
+/// dot-prefixed entries.
+fn walk(dir: &Path, rel: &Path, notes: &mut Vec<PathBuf>) -> Result<(), Error> {
     for entry in fs::read_dir(dir).map_err(resolve_error(dir))? {
         let entry = entry.map_err(resolve_error(dir))?;
         let name = entry.file_name();
@@ -293,12 +309,9 @@ fn walk(dir: &Path, rel: &Path, wanted: &str, matches: &mut Vec<PathBuf>) -> Res
         let file_type = entry.file_type().map_err(resolve_error(&entry.path()))?;
         let entry_rel = rel.join(&name);
         if file_type.is_dir() {
-            walk(&entry.path(), &entry_rel, wanted, matches)?;
-        } else if file_type.is_file()
-            && entry_rel.extension() == Some(OsStr::new("md"))
-            && has_stem(&entry_rel, wanted)
-        {
-            matches.push(entry_rel);
+            walk(&entry.path(), &entry_rel, notes)?;
+        } else if file_type.is_file() && entry_rel.extension() == Some(OsStr::new("md")) {
+            notes.push(entry_rel);
         }
     }
     Ok(())
@@ -686,6 +699,46 @@ mod tests {
         notebook(&root)
             .find("x")
             .expect_err("directory is not a note");
+    }
+
+    #[test]
+    fn notes_lists_every_note_sorted() {
+        let root = temp();
+        fs::write(root.path().join("b.md"), "").expect("fixture writes");
+        fs::create_dir(root.path().join("sub")).expect("fixture dir creates");
+        fs::write(root.path().join("sub").join("a.md"), "").expect("fixture writes");
+        fs::write(root.path().join("a.md"), "").expect("fixture writes");
+        let notes = notebook(&root).notes().expect("notebook lists");
+        assert_eq!(
+            notes,
+            vec![
+                PathBuf::from("a.md"),
+                PathBuf::from("b.md"),
+                Path::new("sub").join("a.md"),
+            ]
+        );
+    }
+
+    #[test]
+    fn notes_skips_hidden_entries_links_and_other_files() {
+        let root = temp();
+        fs::write(root.path().join("a.md"), "").expect("fixture writes");
+        fs::write(root.path().join(".hidden.md"), "").expect("fixture writes");
+        fs::write(root.path().join("plain.txt"), "").expect("fixture writes");
+        fs::create_dir(root.path().join(".git")).expect("fixture dir creates");
+        fs::write(root.path().join(".git").join("c.md"), "").expect("fixture writes");
+        let outside = temp();
+        fs::write(outside.path().join("d.md"), "").expect("fixture writes");
+        link_dir(&root.path().join("linked"), outside.path());
+        let notes = notebook(&root).notes().expect("notebook lists");
+        assert_eq!(notes, vec![PathBuf::from("a.md")]);
+    }
+
+    #[test]
+    fn notes_lists_an_empty_notebook_as_empty() {
+        let root = temp();
+        let notes = notebook(&root).notes().expect("notebook lists");
+        assert!(notes.is_empty());
     }
 
     #[test]
