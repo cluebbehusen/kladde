@@ -729,6 +729,10 @@ fn discard(temp: &Path) {
 fn discard(temp: &Path) {
     if let Ok(metadata) = fs::metadata(temp) {
         let mut permissions = metadata.permissions();
+        #[allow(
+            clippy::permissions_set_readonly_false,
+            reason = "readonly is the only Windows permission bit, and the temp must lose it to be removable"
+        )]
         permissions.set_readonly(false);
         let _ = fs::set_permissions(temp, permissions);
     }
