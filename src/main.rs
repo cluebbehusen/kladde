@@ -261,21 +261,39 @@ struct NotebookArg {
     notebook: Option<PathBuf>,
 }
 
+/// The notebook selection shared by the config subcommands: with it, a
+/// subcommand targets that notebook's own config file instead of the
+/// base config.
+#[derive(Args)]
+struct ConfigNotebookArg {
+    /// Notebook whose config to target, instead of the base config.
+    #[arg(long, value_name = "DIR")]
+    notebook: Option<PathBuf>,
+}
+
 #[derive(Subcommand)]
 enum ConfigCommand {
     /// Print the path of the config file.
-    Path,
+    Path {
+        #[command(flatten)]
+        notebook: ConfigNotebookArg,
+    },
     /// Open the config file in your editor.
     ///
     /// The editor is the `editor` config key if set, otherwise the VISUAL or
     /// EDITOR environment variable.
-    Open,
+    Open {
+        #[command(flatten)]
+        notebook: ConfigNotebookArg,
+    },
     /// Print a setting's value.
     ///
     /// Exits with status 1 and no output when the setting is unset.
     Get {
         /// Setting to print.
         key: ConfigKey,
+        #[command(flatten)]
+        notebook: ConfigNotebookArg,
     },
     /// Change a setting.
     Set {
@@ -283,11 +301,15 @@ enum ConfigCommand {
         key: ConfigKey,
         /// New value.
         value: String,
+        #[command(flatten)]
+        notebook: ConfigNotebookArg,
     },
     /// Remove a setting.
     Unset {
         /// Setting to remove.
         key: ConfigKey,
+        #[command(flatten)]
+        notebook: ConfigNotebookArg,
     },
 }
 
@@ -428,8 +450,8 @@ fn append(
         Ok(locks) => locks,
         Err(message) => return fail(message),
     };
-    let config = match loaded_config(flag.is_some()) {
-        Ok(config) => config,
+    let (config, root) = match layered_config(flag) {
+        Ok(loaded) => loaded,
         Err(message) => return fail(message),
     };
     let placement = kladde::structure::Placement {
@@ -438,7 +460,7 @@ fn append(
         indent: config.bullet_indent.unwrap_or_default(),
     };
     let stamping = stamping(config);
-    dispatch(target, flag, Some(&locks), |note, guard, seed| {
+    dispatch(target, root, Some(&locks), |note, guard, seed| {
         let guard = guard.expect("write dispatch locks the notebook");
         let seed = match seeding(&seed) {
             Ok(seed) => seed,
@@ -568,8 +590,8 @@ fn search(query: &str, flag: Option<PathBuf>) -> ExitCode {
 /// resolving a daily note needs the daily keys, while `config open`
 /// stays lenient so a broken config file can be opened and fixed.
 fn open_note(target: TargetArgs, flag: Option<PathBuf>) -> ExitCode {
-    let config = match loaded_config(flag.is_some()) {
-        Ok(config) => config,
+    let (config, root) = match layered_config(flag) {
+        Ok(loaded) => loaded,
         Err(message) => return fail(message),
     };
     let command = config
@@ -578,7 +600,7 @@ fn open_note(target: TargetArgs, flag: Option<PathBuf>) -> ExitCode {
         .or_else(|| editor_env("EDITOR"));
     dispatch(
         target,
-        flag,
+        root,
         None,
         |note, _guard, _seed| match kladde::editor::open(note.as_path(), command.as_deref()) {
             Ok(()) => ExitCode::SUCCESS,
@@ -594,12 +616,12 @@ fn new_note(target: TargetArgs, flag: Option<PathBuf>) -> ExitCode {
         Ok(locks) => locks,
         Err(message) => return fail(message),
     };
-    let config = match loaded_config(flag.is_some()) {
-        Ok(config) => config,
+    let (config, root) = match layered_config(flag) {
+        Ok(loaded) => loaded,
         Err(message) => return fail(message),
     };
     let stamping = stamping(config);
-    dispatch(target, flag, Some(&locks), |note, guard, seed| {
+    dispatch(target, root, Some(&locks), |note, guard, seed| {
         let guard = guard.expect("write dispatch locks the notebook");
         let seed = match seeding(&seed) {
             Ok(seed) => seed,
@@ -796,12 +818,12 @@ fn frontmatter_edit(
         Ok(locks) => locks,
         Err(message) => return fail(message),
     };
-    let config = match loaded_config(flag.is_some()) {
-        Ok(config) => config,
+    let (config, root) = match layered_config(flag) {
+        Ok(loaded) => loaded,
         Err(message) => return fail(message),
     };
     let stamping = stamping(config);
-    dispatch(target, flag, Some(&locks), |note, guard, seed| {
+    dispatch(target, root, Some(&locks), |note, guard, seed| {
         let guard = guard.expect("write dispatch locks the notebook");
         let seed = match seeding(&seed) {
             Ok(seed) => seed,
@@ -885,8 +907,8 @@ fn daily_note(
     locks: Option<&Path>,
     act: impl FnOnce(&Note, Option<&kladde::write::Guard>, Seed) -> ExitCode,
 ) -> ExitCode {
-    let config = match loaded_config(flag.is_some()) {
-        Ok(config) => config,
+    let (config, root) = match layered_config(flag) {
+        Ok(loaded) => loaded,
         Err(message) => return fail(message),
     };
     let today = jiff::Zoned::now().date();
@@ -897,7 +919,7 @@ fn daily_note(
         },
         None => today,
     };
-    let Some(root) = flag.or(config.default_notebook) else {
+    let Some(root) = root else {
         return fail(NO_NOTEBOOK);
     };
     let format = config.daily_date_format.unwrap_or_default();
@@ -976,13 +998,11 @@ fn seeding(seed: &Seed) -> Result<Option<&str>, &str> {
     }
 }
 
-/// The config a command draws optional keys from: the daily note keys and
-/// the stamp keys have no flag override, so even an explicit `--notebook`
-/// reads the file, and a broken config fails the command rather than
-/// silently dropping those keys. A missing file is an empty config; an
-/// unlocatable config directory is one too when `--notebook` pins the
-/// notebook, and an error otherwise, since the default notebook could
-/// only come from config.
+/// The base config file, strictly loaded: a broken config fails the
+/// command rather than silently dropping keys. A missing file is an
+/// empty config; an unlocatable config directory is one too when
+/// `--notebook` pins the notebook, and an error otherwise, since the
+/// default notebook could only come from config.
 fn loaded_config(explicit_notebook: bool) -> Result<kladde::config::Config, String> {
     let file = kladde::config::file(
         env::var_os("XDG_CONFIG_HOME").map(PathBuf::from),
@@ -993,6 +1013,26 @@ fn loaded_config(explicit_notebook: bool) -> Result<kladde::config::Config, Stri
         None if explicit_notebook => Ok(kladde::config::Config::default()),
         None => Err(NO_CONFIG_DIR.to_owned()),
     }
+}
+
+/// The config a command draws optional keys from: the base config with
+/// the notebook's own `.kladde.toml` layered over it. The daily note
+/// keys and the stamp keys have no flag override, so even an explicit
+/// `--notebook` reads both files, and a broken one fails the command
+/// rather than silently dropping keys. Also returns the notebook root
+/// the layering used, `None` when nothing names one; the command then
+/// fails wherever it needs a notebook.
+fn layered_config(
+    flag: Option<PathBuf>,
+) -> Result<(kladde::config::Config, Option<PathBuf>), String> {
+    let config = loaded_config(flag.is_some())?;
+    let Some(root) = flag.or_else(|| config.default_notebook.clone()) else {
+        return Ok((config, None));
+    };
+    let notebook = kladde::notebook::Notebook::open(&root).map_err(|error| error.to_string())?;
+    let file = notebook.config_file().map_err(|error| error.to_string())?;
+    let overlay = kladde::config::load_notebook(&file).map_err(|error| error.to_string())?;
+    Ok((config.layered(overlay), Some(root)))
 }
 
 /// The notebook a command operates on: the `--notebook` value as given, or
@@ -1014,27 +1054,68 @@ fn notebook_root(flag: Option<PathBuf>) -> Result<PathBuf, String> {
 }
 
 fn config(command: ConfigCommand) -> ExitCode {
-    let file = kladde::config::file(
-        env::var_os("XDG_CONFIG_HOME").map(PathBuf::from),
-        env::var_os("HOME").map(PathBuf::from),
-    );
-    let Some(file) = file else {
-        return fail(NO_CONFIG_DIR);
+    let flag = match &command {
+        ConfigCommand::Path { notebook }
+        | ConfigCommand::Open { notebook }
+        | ConfigCommand::Get { notebook, .. }
+        | ConfigCommand::Set { notebook, .. }
+        | ConfigCommand::Unset { notebook, .. } => notebook.notebook.clone(),
+    };
+    let (file, in_notebook) = match config_target(flag) {
+        Ok(target) => target,
+        Err(message) => return fail(message),
     };
     match command {
-        ConfigCommand::Path => {
+        ConfigCommand::Path { .. } => {
             print_path(&file);
             ExitCode::SUCCESS
         }
-        ConfigCommand::Open => open(&file),
-        ConfigCommand::Get { key } => get(&file, key),
-        ConfigCommand::Set { key, value } => set(&file, key, &value),
-        ConfigCommand::Unset { key } => finish(kladde::config::unset(&file, key.name())),
+        ConfigCommand::Open { .. } => open(&file, in_notebook),
+        ConfigCommand::Get { key, .. } => get(&file, key, in_notebook),
+        ConfigCommand::Set { key, value, .. } => set(&file, key, &value, in_notebook),
+        ConfigCommand::Unset { key, .. } => finish(kladde::config::unset(&file, key.name())),
     }
 }
 
-fn get(file: &Path, key: ConfigKey) -> ExitCode {
-    let config = match kladde::config::load(file) {
+/// The config file a config subcommand targets, and whether it is a
+/// notebook's own: with `--notebook`, that notebook's config file (the
+/// notebook must exist); the base config file otherwise.
+fn config_target(flag: Option<PathBuf>) -> Result<(PathBuf, bool), String> {
+    if let Some(root) = flag {
+        let notebook =
+            kladde::notebook::Notebook::open(&root).map_err(|error| error.to_string())?;
+        let file = notebook.config_file().map_err(|error| error.to_string())?;
+        return Ok((file, true));
+    }
+    let file = kladde::config::file(
+        env::var_os("XDG_CONFIG_HOME").map(PathBuf::from),
+        env::var_os("HOME").map(PathBuf::from),
+    )
+    .ok_or_else(|| NO_CONFIG_DIR.to_owned())?;
+    Ok((file, false))
+}
+
+/// The refusal for a machine-scoped key aimed at a notebook config,
+/// `None` when the key is allowed there.
+fn barred(key: ConfigKey, in_notebook: bool) -> Option<String> {
+    (in_notebook && kladde::config::machine_scoped(key.name())).then(|| {
+        format!(
+            "`{}` is machine-scoped: a notebook config cannot hold it",
+            key.name()
+        )
+    })
+}
+
+fn get(file: &Path, key: ConfigKey, in_notebook: bool) -> ExitCode {
+    if let Some(message) = barred(key, in_notebook) {
+        return fail(message);
+    }
+    let loaded = if in_notebook {
+        kladde::config::load_notebook(file)
+    } else {
+        kladde::config::load(file)
+    };
+    let config = match loaded {
         Ok(config) => config,
         Err(error) => return fail(error),
     };
@@ -1074,7 +1155,10 @@ fn get(file: &Path, key: ConfigKey) -> ExitCode {
     }
 }
 
-fn set(file: &Path, key: ConfigKey, value: &str) -> ExitCode {
+fn set(file: &Path, key: ConfigKey, value: &str, in_notebook: bool) -> ExitCode {
+    if let Some(message) = barred(key, in_notebook) {
+        return fail(message);
+    }
     match key {
         ConfigKey::DefaultNotebook => match std::path::absolute(value) {
             Ok(notebook) => finish(kladde::config::set_default_notebook(file, &notebook)),
@@ -1105,14 +1189,25 @@ fn printed<T>(value: Option<T>, print: impl FnOnce(&T)) -> ExitCode {
     }
 }
 
-fn open(file: &Path) -> ExitCode {
-    let configured = match kladde::config::load(file) {
+/// Opens `file` in the editor. The editor comes from the base config,
+/// which a notebook config cannot override; the load stays lenient so
+/// a broken config can be opened and fixed.
+fn open(file: &Path, in_notebook: bool) -> ExitCode {
+    let source = if in_notebook {
+        kladde::config::file(
+            env::var_os("XDG_CONFIG_HOME").map(PathBuf::from),
+            env::var_os("HOME").map(PathBuf::from),
+        )
+    } else {
+        Some(file.to_path_buf())
+    };
+    let configured = source.and_then(|source| match kladde::config::load(&source) {
         Ok(config) => config.editor,
         Err(error) => {
             eprintln!("kladde: ignoring invalid config: {error}");
             None
         }
-    };
+    });
     let command = configured
         .or_else(|| editor_env("VISUAL"))
         .or_else(|| editor_env("EDITOR"));

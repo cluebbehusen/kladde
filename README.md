@@ -33,5 +33,5 @@ see [Configuration](#configuration).
 
 ## Configuration
 
-Kladde is configured through a single TOML file; see the
-[configuration reference](docs/config.md).
+Kladde is configured through a TOML file, and a notebook can carry its own that
+overrides it; see the [configuration reference](docs/config.md).

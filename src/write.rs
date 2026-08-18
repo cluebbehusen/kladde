@@ -102,7 +102,7 @@ pub fn lock_dir(xdg_state_home: Option<PathBuf>, home: Option<PathBuf>) -> Optio
 /// and lose entries. Non-Unicode paths are hashed through their lossy
 /// form. A collision (hash or lossy) merely makes two notebooks share a
 /// lock file: spurious serialization, never lost mutual exclusion.
-fn hashed(path: &Path) -> String {
+pub(crate) fn hashed(path: &Path) -> String {
     const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
     const PRIME: u64 = 0x0000_0100_0000_01b3;
     let mut hash = OFFSET;
@@ -118,12 +118,16 @@ fn lock_name(root: &Path) -> String {
     format!("{}.lock", hashed(root))
 }
 
+/// The suffix every kladde temporary file carries: note targeting
+/// refuses it, and stale entries under it may be cleared.
+pub(crate) const TEMP_SUFFIX: &str = ".kladde-tmp";
+
 /// The temporary file name for a note, from its notebook-relative path:
 /// hashing keeps the name within filesystem limits however long the
 /// note's name is, and a collision merely makes two notes share a
 /// temporary name, which the notebook lock already serializes.
 fn temp_name(relative: &Path) -> String {
-    format!(".{}.kladde-tmp", hashed(relative))
+    format!(".{}{}", hashed(relative), TEMP_SUFFIX)
 }
 
 /// An exclusive lock on a notebook, held until dropped.
