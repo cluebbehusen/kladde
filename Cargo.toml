@@ -3,9 +3,29 @@ name = "kladde"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.89"
-description = "CLI for a local markdown notebook: daily notes, generic notes, and section-aware appends that are safe under concurrent writers"
+description = "CLI for a local markdown notebook, built for coding agents: daily notes, generic notes, and section-aware appends that are safe under concurrent writers"
+authors = ["Connor Luebbehusen <connor@luebbehusen.dev>"]
 repository = "https://github.com/cluebbehusen/kladde"
+homepage = "https://github.com/cluebbehusen/kladde"
 license = "MIT"
+readme = "README.md"
+keywords = ["markdown", "notes", "notebook", "daily-notes", "agent"]
+categories = ["command-line-utilities", "text-processing"]
+exclude = [
+    "/.cargo",
+    "/.github",
+    "/.gitignore",
+    "/.prettierrc",
+    "/AGENTS.md",
+    "/CLAUDE.md",
+    "/ROADMAP.md",
+    "/deny.toml",
+    "/dist-workspace.toml",
+    "/docs",
+    "/pyproject.toml",
+    "/skills",
+    "/tests",
+]
 
 [dependencies]
 caseless = "0.2.2"
