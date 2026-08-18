@@ -6312,24 +6312,20 @@ fn config_set_reports_a_link_chain_too_deep() {
         .stderr(contains("too many levels of links"));
 }
 
-/// The Windows twin of the cycle refusal: a junction chain deeper than
-/// any real layout.
+/// The Windows twin of the too-deep refusal, over file symlinks.
 #[cfg(windows)]
 #[test]
-fn config_set_reports_a_junction_chain_too_deep() {
+fn config_set_reports_a_link_chain_too_deep() {
     let xdg = temp();
     let config_dir = xdg.path().join("kladde");
     fs::create_dir_all(&config_dir).expect("config dir creates");
-    let real = config_dir.join("real");
-    fs::create_dir(&real).expect("fixture dir creates");
-    let mut prev = real.clone();
+    let mut prev = config_dir.join("gone.toml");
     for index in 0..8 {
-        let link = config_dir.join(format!("j{index}"));
-        link_dir(&link, &prev);
+        let link = config_dir.join(format!("l{index}.toml"));
+        std::os::windows::fs::symlink_file(&prev, &link).expect("symlink creates");
         prev = link;
     }
-    link_dir(&config_file(xdg.path()), &prev);
-    fs::remove_dir(&real).expect("target removes");
+    std::os::windows::fs::symlink_file(&prev, config_file(xdg.path())).expect("symlink creates");
     kladde_in(xdg.path())
         .args(["config", "set", "daily-folder", "Journal"])
         .assert()

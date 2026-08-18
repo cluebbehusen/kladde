@@ -1126,37 +1126,23 @@ mod tests {
         assert!(base.path().join("managed").join("other.toml").exists());
     }
 
-    /// A junction: created while its target exists, so chains can be
-    /// built link by link and left dangling by removing the one real
-    /// directory at the end.
-    #[cfg(windows)]
-    fn junction(link: &Path, target: &Path) {
-        let cmd = format!(
-            "{}\\System32\\cmd.exe",
-            std::env::var("SYSTEMROOT").expect("SYSTEMROOT is set on Windows")
-        );
-        let status = std::process::Command::new(cmd)
-            .args(["/C", "mklink", "/J"])
-            .arg(link)
-            .arg(target)
-            .status()
-            .expect("mklink runs");
-        assert!(status.success());
-    }
-
-    /// The Windows twin of the dangling-link walk, through a junction
-    /// whose target directory is gone.
+    /// The Windows twin of the dangling-link walk. File symlinks need no
+    /// elevation on runners with developer mode enabled, and a dangling
+    /// one reads as missing, like on Unix.
     #[cfg(windows)]
     #[test]
-    fn set_creates_the_target_of_a_dangling_junction() {
+    fn set_creates_the_target_of_a_dangling_link() {
         let base = temp();
         let managed = temp();
-        let target = managed.path().join("gone");
-        fs::create_dir(&target).expect("fixture dir creates");
+        let target = managed.path().join("machine.toml");
         let file = base.path().join("config.toml");
-        junction(&file, &target);
-        fs::remove_dir(&target).expect("target removes");
+        std::os::windows::fs::symlink_file(&target, &file).expect("symlink creates");
         set_editor(&file, "vim").expect("set succeeds");
+        assert!(
+            fs::symlink_metadata(&file)
+                .expect("metadata reads")
+                .is_symlink()
+        );
         assert!(
             fs::read_to_string(&target)
                 .expect("target reads")
@@ -1207,23 +1193,19 @@ mod tests {
         );
     }
 
-    /// The Windows twin of the cycle refusal: a junction chain deeper
-    /// than any real layout.
+    /// The Windows twin of the too-deep refusal, over file symlinks.
     #[cfg(windows)]
     #[test]
-    fn set_reports_a_junction_chain_too_deep() {
+    fn set_reports_a_link_chain_too_deep() {
         let base = temp();
-        let real = base.path().join("real");
-        fs::create_dir(&real).expect("fixture dir creates");
-        let mut prev = real.clone();
+        let mut prev = base.path().join("gone.toml");
         for index in 0..8 {
-            let link = base.path().join(format!("j{index}"));
-            junction(&link, &prev);
+            let link = base.path().join(format!("l{index}.toml"));
+            std::os::windows::fs::symlink_file(&prev, &link).expect("symlink creates");
             prev = link;
         }
         let file = base.path().join("config.toml");
-        junction(&file, &prev);
-        fs::remove_dir(&real).expect("target removes");
+        std::os::windows::fs::symlink_file(&prev, &file).expect("symlink creates");
         let error = set_editor(&file, "vim").expect_err("deep chain fails");
         assert!(
             error.to_string().contains("too many levels of links"),
