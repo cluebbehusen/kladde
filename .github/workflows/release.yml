@@ -287,8 +287,8 @@ jobs:
     secrets: inherit
     # publish jobs get escalated permissions
     permissions:
+      "contents": "read"
       "id-token": "write"
-      "packages": "write"
 
   custom-publish-pypi:
     needs:
@@ -301,8 +301,8 @@ jobs:
     secrets: inherit
     # publish jobs get escalated permissions
     permissions:
+      "contents": "read"
       "id-token": "write"
-      "packages": "write"
 
   announce:
     needs:

@@ -20,6 +20,11 @@ install-path = "CARGO_HOME"
 # Whether to install an updater program
 install-updater = false
 
+# Permissions granted to the custom publish jobs
+[dist.github-custom-job-permissions]
+publish-crates = { id-token = "write", contents = "read" }
+publish-pypi = { id-token = "write", contents = "read" }
+
 # Commit SHAs the generated workflow pins its actions to
 [dist.github-action-commits]
 "actions/checkout" = "3d3c42e5aac5ba805825da76410c181273ba90b1" # v7.0.1
