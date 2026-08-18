@@ -83,6 +83,11 @@ fn write_config(xdg: &Path, contents: &str) {
     fs::write(config_dir.join("config.toml"), contents).expect("config file writes");
 }
 
+/// Writes a notebook's own config at its root.
+fn write_notebook_config(nb: &TempDir, contents: &str) {
+    fs::write(nb.path().join(".kladde.toml"), contents).expect("notebook config writes");
+}
+
 fn set_readonly(path: &Path, readonly: bool) {
     let mut permissions = fs::metadata(path).expect("metadata reads").permissions();
     #[allow(
@@ -406,6 +411,27 @@ fn config_set_rejects_missing_directory() {
         .stderr(contains("not a directory"));
 }
 
+/// Unix allows renaming over a readonly file, like every note write.
+#[cfg(unix)]
+#[test]
+fn config_set_replaces_a_readonly_file() {
+    let xdg = temp();
+    let notebook = temp();
+    write_config(xdg.path(), "");
+    set_readonly(&config_file(xdg.path()), true);
+    kladde_in(xdg.path())
+        .args(["config", "set", "default-notebook"])
+        .arg(notebook.path())
+        .assert()
+        .success();
+    kladde_in(xdg.path())
+        .args(["config", "get", "default-notebook"])
+        .assert()
+        .success();
+    set_readonly(&config_file(xdg.path()), false);
+}
+
+#[cfg(windows)]
 #[test]
 fn config_set_reports_unwritable_file() {
     let xdg = temp();
@@ -419,6 +445,33 @@ fn config_set_reports_unwritable_file() {
         .code(1)
         .stderr(contains("cannot write"));
     set_readonly(&config_file(xdg.path()), false);
+    let leftovers = fs::read_dir(xdg.path().join("kladde"))
+        .expect("dir reads")
+        .filter(|entry| {
+            entry
+                .as_ref()
+                .expect("entry reads")
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".kladde-tmp")
+        })
+        .count();
+    assert_eq!(leftovers, 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn config_set_reports_an_unwritable_directory() {
+    let xdg = temp();
+    write_config(xdg.path(), "");
+    let config_dir = xdg.path().join("kladde");
+    set_readonly(&config_dir, true);
+    kladde_in(xdg.path())
+        .args(["config", "set", "editor", "vim"])
+        .assert()
+        .code(1)
+        .stderr(contains("cannot write"));
+    set_readonly(&config_dir, false);
 }
 
 #[cfg(unix)]
@@ -5517,4 +5570,808 @@ fn append_concurrent_writers_lose_nothing() {
     }
     assert!(contents.ends_with('\n'));
     assert!(!contents.contains("\n\n"));
+}
+
+#[test]
+fn daily_uses_the_notebook_config_folder_and_format() {
+    let nb = temp();
+    write_notebook_config(&nb, "daily-folder = 'Journal'\ndaily-date-format = '%Y'\n");
+    kladde()
+        .args(["path", "--date", "2026-01-05", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success()
+        .stdout(format!(
+            "{}\n",
+            canonical(nb.path())
+                .join("Journal")
+                .join("2026.md")
+                .display()
+        ));
+}
+
+/// A key set in both files takes the notebook's value; a key only the
+/// base sets still applies.
+#[test]
+fn notebook_config_wins_over_the_base_key_by_key() {
+    let (nb, xdg) = (temp(), temp());
+    write_config(
+        xdg.path(),
+        "daily-folder = 'Base'\ndaily-date-format = '%Y'\n",
+    );
+    write_notebook_config(&nb, "daily-folder = 'Nb'\n");
+    kladde_in(xdg.path())
+        .args(["path", "--date", "2026-01-05", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success()
+        .stdout(format!(
+            "{}\n",
+            canonical(nb.path()).join("Nb").join("2026.md").display()
+        ));
+}
+
+#[test]
+fn notebook_config_layers_under_the_default_notebook() {
+    let (nb, xdg) = (temp(), temp());
+    write_config(
+        xdg.path(),
+        &format!("default-notebook = '{}'\n", nb.path().display()),
+    );
+    write_notebook_config(&nb, "daily-folder = 'Journal'\n");
+    kladde_in(xdg.path())
+        .args(["path", "--date", "2026-01-05"])
+        .assert()
+        .success()
+        .stdout(format!(
+            "{}\n",
+            canonical(nb.path())
+                .join("Journal")
+                .join("2026-01-05.md")
+                .display()
+        ));
+}
+
+#[test]
+fn daily_seeds_from_the_notebook_config_template() {
+    let (nb, state) = (temp(), temp());
+    write_template(&nb, "# {{title}}\n\n## Log\n");
+    write_notebook_config(
+        &nb,
+        "stamp = false\ndaily-template = 'templates/Daily.md'\n",
+    );
+    kladde_state(state.path())
+        .args(["append", "- entry", "--date", "2026-01-05", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success();
+    assert_eq!(dated_contents(&nb), "# 2026-01-05\n\n## Log\n- entry\n");
+}
+
+#[test]
+fn stamping_uses_the_notebook_config_keys_and_format() {
+    let (nb, state) = (temp(), temp());
+    write_notebook_config(
+        &nb,
+        "stamp-created-key = 'made'\nstamp-updated-key = 'touched'\nstamp-format = 'X'\n",
+    );
+    kladde_state(state.path())
+        .args(["frontmatter", "set", "k", "v", "x.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success();
+    assert_eq!(x_contents(&nb), "---\nk: v\nmade: X\ntouched: X\n---\n");
+}
+
+#[test]
+fn stamping_skips_paths_the_notebook_config_excludes() {
+    let (nb, state) = (temp(), temp());
+    write_notebook_config(&nb, "stamp-exclude = ['skip']\n");
+    kladde_state(state.path())
+        .args(["append", "- x", "skip/x.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success();
+    assert_eq!(
+        fs::read_to_string(nb.path().join("skip").join("x.md")).expect("note reads"),
+        "- x\n"
+    );
+}
+
+#[test]
+fn append_under_bullet_honors_the_notebook_config_indent() {
+    let (nb, state) = (temp(), temp());
+    write_notebook_config(&nb, "stamp = false\nbullet-indent = 'spaces'\n");
+    fs::write(nb.path().join("x.md"), "1. a\n").expect("fixture writes");
+    kladde_state(state.path())
+        .args(["append", "- e", "x.md", "--under-bullet", "a", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success();
+    assert_eq!(x_contents(&nb), "1. a\n   - e\n");
+}
+
+/// Every command that consumes notebook-scoped keys fails on a broken
+/// notebook config, explicit target or daily, and creates nothing.
+#[test]
+fn writes_report_a_broken_notebook_config() {
+    let (nb, state) = (temp(), temp());
+    write_notebook_config(&nb, "not toml [\n");
+    for argv in [
+        &["append", "- x", "x.md"][..],
+        &["append", "- x", "--date", "2026-01-05"],
+        &["new", "x.md"],
+        &["frontmatter", "set", "k", "v", "x.md"],
+        &["open", "x.md"],
+        &["path", "--date", "2026-01-05"],
+    ] {
+        kladde_state(state.path())
+            .args(argv)
+            .arg("--notebook")
+            .arg(nb.path())
+            .assert()
+            .code(1)
+            .stderr(contains("invalid TOML"))
+            .stderr(contains(".kladde.toml"));
+    }
+    assert!(!nb.path().join("x.md").exists());
+    assert!(!nb.path().join("2026-01-05.md").exists());
+}
+
+/// Commands that consume no notebook-scoped keys never read the notebook
+/// config: a broken one does not fail them, and the file never appears
+/// in listings or search.
+#[test]
+fn reads_ignore_a_broken_notebook_config() {
+    let nb = temp();
+    fs::write(nb.path().join("x.md"), "hi\n").expect("fixture writes");
+    write_notebook_config(&nb, "not toml [\n");
+    kladde()
+        .args(["path", "x.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success();
+    kladde()
+        .args(["read", "x.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success()
+        .stdout("hi\n");
+    kladde()
+        .args(["list", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success()
+        .stdout("x.md\n");
+    kladde()
+        .args(["search", "hi", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success()
+        .stdout("x.md\n");
+    kladde()
+        .args(["search", "toml", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .code(1)
+        .stdout("");
+}
+
+#[test]
+fn writes_reject_a_machine_key_in_the_notebook_config() {
+    let (nb, state) = (temp(), temp());
+    write_notebook_config(&nb, "editor = 'vim'\n");
+    kladde_state(state.path())
+        .args(["append", "- x", "x.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .code(1)
+        .stderr(contains("sets `editor`, which is machine-scoped"))
+        .stderr(contains(".kladde.toml"));
+    assert!(!nb.path().join("x.md").exists());
+}
+
+#[test]
+fn writes_report_an_unknown_notebook_config_key() {
+    let (nb, state) = (temp(), temp());
+    write_notebook_config(&nb, "unknown = 1\n");
+    kladde_state(state.path())
+        .args(["append", "- x", "x.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .code(1)
+        .stderr(contains("unknown key `unknown`"))
+        .stderr(contains(".kladde.toml"));
+}
+
+#[test]
+fn writes_report_an_unreadable_notebook_config() {
+    let (nb, state) = (temp(), temp());
+    fs::write(nb.path().join(".kladde.toml"), [0xFF, 0xFE, 0x00]).expect("obstacle writes");
+    kladde_state(state.path())
+        .args(["append", "- x", "x.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .code(1)
+        .stderr(contains("cannot read"));
+}
+
+/// A directory or any other irregular entry at the config name is
+/// rejected outright, for the config surface and the note writes alike.
+#[test]
+fn commands_reject_an_irregular_notebook_config() {
+    let (nb, state) = (temp(), temp());
+    fs::create_dir(nb.path().join(".kladde.toml")).expect("obstacle creates");
+    kladde_state(state.path())
+        .args(["append", "- x", "x.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .code(1)
+        .stderr(contains("is not a regular file"));
+    kladde()
+        .args(["config", "set", "daily-folder", "Journal", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .code(1)
+        .stderr(contains("is not a regular file"));
+}
+
+/// A pipe at the config name fails fast instead of blocking the command
+/// forever on a read no writer will ever feed.
+#[cfg(unix)]
+#[test]
+fn commands_reject_a_fifo_notebook_config() {
+    let (nb, state) = (temp(), temp());
+    let status = std::process::Command::new("mkfifo")
+        .arg(nb.path().join(".kladde.toml"))
+        .status()
+        .expect("mkfifo runs");
+    assert!(status.success());
+    kladde_state(state.path())
+        .args(["path", "--date", "2026-01-05", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .code(1)
+        .stderr(contains("is not a regular file"));
+}
+
+/// Explicit-note commands never touch the notebook config, so a pipe at
+/// its name must not stall them either.
+#[cfg(unix)]
+#[test]
+fn explicit_reads_ignore_a_fifo_notebook_config() {
+    let nb = temp();
+    fs::write(nb.path().join("x.md"), "hi\n").expect("fixture writes");
+    let status = std::process::Command::new("mkfifo")
+        .arg(nb.path().join(".kladde.toml"))
+        .status()
+        .expect("mkfifo runs");
+    assert!(status.success());
+    kladde()
+        .args(["path", "x.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success();
+    kladde()
+        .args(["read", "--name", "x", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success()
+        .stdout("hi\n");
+}
+
+/// A bad value in the notebook config names the file, because by then
+/// there are two files it could live in.
+#[test]
+fn writes_report_a_bad_notebook_config_value() {
+    let (nb, state) = (temp(), temp());
+    write_notebook_config(&nb, "daily-folder = ''\n");
+    kladde_state(state.path())
+        .args(["append", "- x", "x.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .code(1)
+        .stderr(contains("in notebook config"))
+        .stderr(contains("`daily-folder` must not be empty"));
+    assert!(!nb.path().join("x.md").exists());
+}
+
+/// Every notebook-scoped key round-trips through the notebook config,
+/// without touching the base config or needing a config directory.
+#[test]
+fn config_notebook_keys_round_trip() {
+    let (nb, xdg) = (temp(), temp());
+    let cases = [
+        ("daily-folder", "Journal", "Journal\n"),
+        ("daily-date-format", "%Y", "%Y\n"),
+        (
+            "daily-template",
+            "templates/Daily.md",
+            "templates/Daily.md\n",
+        ),
+        ("stamp", "false", "false\n"),
+        ("stamp-created-key", "made", "made\n"),
+        ("stamp-updated-key", "touched", "touched\n"),
+        ("stamp-format", "%Y-%m-%dT%H:%M", "%Y-%m-%dT%H:%M\n"),
+        (
+            "stamp-exclude",
+            "templates, archive/2026",
+            "templates,archive/2026\n",
+        ),
+        ("bullet-indent", "spaces", "spaces\n"),
+    ];
+    for (key, value, printed) in cases {
+        kladde()
+            .args(["config", "get", key, "--notebook"])
+            .arg(nb.path())
+            .assert()
+            .code(1)
+            .stdout("");
+        kladde()
+            .args(["config", "set", key, value, "--notebook"])
+            .arg(nb.path())
+            .assert()
+            .success();
+        kladde()
+            .args(["config", "get", key, "--notebook"])
+            .arg(nb.path())
+            .assert()
+            .success()
+            .stdout(printed.to_owned());
+        kladde_in(xdg.path())
+            .args(["config", "get", key])
+            .assert()
+            .code(1)
+            .stdout("");
+        kladde()
+            .args(["config", "unset", key, "--notebook"])
+            .arg(nb.path())
+            .assert()
+            .success();
+        kladde()
+            .args(["config", "get", key, "--notebook"])
+            .arg(nb.path())
+            .assert()
+            .code(1)
+            .stdout("");
+    }
+}
+
+#[test]
+fn config_set_rejects_machine_keys_in_a_notebook() {
+    let nb = temp();
+    for (key, value) in [("editor", "vim"), ("default-notebook", "/notes")] {
+        kladde()
+            .args(["config", "set", key, value, "--notebook"])
+            .arg(nb.path())
+            .assert()
+            .code(1)
+            .stderr(contains(format!(
+                "`{key}` is machine-scoped: a notebook config cannot hold it"
+            )));
+    }
+    assert!(!nb.path().join(".kladde.toml").exists());
+}
+
+#[test]
+fn config_get_rejects_machine_keys_in_a_notebook() {
+    let nb = temp();
+    kladde()
+        .args(["config", "get", "editor", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .code(1)
+        .stderr(contains("`editor` is machine-scoped"));
+}
+
+/// `unset` skips the machine-scope guard: it is the repair tool for a
+/// hand-edited notebook config that every load rejects.
+#[test]
+fn config_unset_repairs_a_machine_key_in_a_notebook() {
+    let (nb, state) = (temp(), temp());
+    write_notebook_config(&nb, "editor = 'vim'\ndaily-folder = 'Journal'\n");
+    kladde_state(state.path())
+        .args(["append", "- x", "--date", "2026-01-05", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .code(1)
+        .stderr(contains("machine-scoped"));
+    kladde()
+        .args(["config", "unset", "editor", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success();
+    kladde_state(state.path())
+        .args(["append", "- x", "--date", "2026-01-05", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success();
+    assert!(nb.path().join("Journal").join("2026-01-05.md").exists());
+}
+
+#[test]
+fn config_set_validates_through_a_notebook() {
+    let nb = temp();
+    kladde()
+        .args(["config", "set", "daily-folder", "/abs", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .code(1)
+        .stderr(contains("must be a relative path"));
+    assert!(!nb.path().join(".kladde.toml").exists());
+}
+
+#[test]
+fn config_path_prints_the_notebook_config_path() {
+    let nb = temp();
+    kladde()
+        .args(["config", "path", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success()
+        .stdout(format!(
+            "{}\n",
+            canonical(nb.path()).join(".kladde.toml").display()
+        ));
+}
+
+#[test]
+fn config_path_reports_a_missing_notebook() {
+    let nb = temp();
+    kladde()
+        .args(["config", "path", "--notebook"])
+        .arg(nb.path().join("gone"))
+        .assert()
+        .code(1)
+        .stderr(contains("cannot open notebook"));
+}
+
+#[test]
+fn config_open_opens_the_notebook_config() {
+    let (nb, xdg) = (temp(), temp());
+    write_config(xdg.path(), &format!("editor = '{}'\n", creating_editor()));
+    kladde_in(xdg.path())
+        .args(["config", "open", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success();
+    assert!(nb.path().join(".kladde.toml").exists());
+}
+
+#[test]
+fn config_open_notebook_falls_back_to_visual_without_a_config_base() {
+    let nb = temp();
+    kladde()
+        .env("VISUAL", creating_editor())
+        .args(["config", "open", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success();
+    assert!(nb.path().join(".kladde.toml").exists());
+}
+
+#[test]
+fn config_set_preserves_notebook_config_comments() {
+    let nb = temp();
+    write_notebook_config(&nb, "# mine\ndaily-folder = 'a'\n");
+    kladde()
+        .args(["config", "set", "daily-date-format", "%Y", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success();
+    let contents = fs::read_to_string(nb.path().join(".kladde.toml")).expect("config reads");
+    assert!(contents.contains("# mine"), "{contents}");
+    assert!(contents.contains("daily-folder = 'a'"), "{contents}");
+}
+
+/// The notebook config's name is reserved: a note command cannot write
+/// markdown into it, in any spelling that would alias it.
+#[test]
+fn note_targets_cannot_name_the_notebook_config() {
+    let (nb, state) = (temp(), temp());
+    for target in [".kladde.toml", ".KLADDE.TOML", ".kladde.toml/x.md"] {
+        kladde_state(state.path())
+            .args(["new", target, "--notebook"])
+            .arg(nb.path())
+            .assert()
+            .code(1)
+            .stderr(contains("names the notebook config, not a note"));
+    }
+    kladde()
+        .args(["read", ".kladde.toml", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .code(1)
+        .stderr(contains("names the notebook config, not a note"));
+    assert!(!nb.path().join(".kladde.toml").exists());
+    assert!(!nb.path().join(".KLADDE.TOML").exists());
+}
+
+/// Only the root-level name is reserved; deeper down it is an ordinary
+/// dot file.
+#[test]
+fn a_nested_kladde_toml_is_an_ordinary_target() {
+    let (nb, state) = (temp(), temp());
+    kladde_state(state.path())
+        .args(["append", "- x", "sub/.kladde.toml", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success();
+    assert!(nb.path().join("sub").join(".kladde.toml").exists());
+}
+
+/// A linked notebook config is refused before anything reads or writes
+/// through it, so a planted link cannot reach outside the notebook.
+#[test]
+fn config_commands_reject_a_linked_notebook_config() {
+    let (nb, target) = (temp(), temp());
+    link_dir(&nb.path().join(".kladde.toml"), target.path());
+    for argv in [
+        &["config", "set", "daily-folder", "Journal"][..],
+        &["config", "unset", "daily-folder"],
+        &["config", "get", "daily-folder"],
+        &["config", "open"],
+        &["config", "path"],
+    ] {
+        kladde()
+            .args(argv)
+            .arg("--notebook")
+            .arg(nb.path())
+            .assert()
+            .code(1)
+            .stderr(contains("is not a regular file"));
+    }
+}
+
+#[test]
+fn writes_reject_a_linked_notebook_config() {
+    let (nb, target, state) = (temp(), temp(), temp());
+    link_dir(&nb.path().join(".kladde.toml"), target.path());
+    kladde_state(state.path())
+        .args(["append", "- x", "--date", "2026-01-05", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .code(1)
+        .stderr(contains("is not a regular file"));
+    assert!(!nb.path().join("2026-01-05.md").exists());
+}
+
+/// The attack the link rule exists for: a planted link aimed at an
+/// outside TOML file must not let a config write modify that file.
+#[cfg(unix)]
+#[test]
+fn config_set_refuses_to_write_through_a_planted_link() {
+    let (nb, outside) = (temp(), temp());
+    let victim = outside.path().join("victim.toml");
+    fs::write(&victim, "editor = 'vim'\n").expect("fixture writes");
+    std::os::unix::fs::symlink(&victim, nb.path().join(".kladde.toml")).expect("symlink creates");
+    kladde()
+        .args(["config", "set", "daily-folder", "Journal", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .code(1)
+        .stderr(contains("is not a regular file"));
+    assert_eq!(
+        fs::read_to_string(&victim).expect("victim reads"),
+        "editor = 'vim'\n"
+    );
+}
+
+/// A hard link is indistinguishable from a regular file, but the rename
+/// write path replaces the notebook's directory entry instead of writing
+/// through it, so the outside inode never changes.
+#[cfg(unix)]
+#[test]
+fn config_set_never_writes_through_a_hard_link() {
+    let (nb, outside) = (temp(), temp());
+    let victim = outside.path().join("victim.toml");
+    fs::write(&victim, "stamp = false\n").expect("fixture writes");
+    fs::hard_link(&victim, nb.path().join(".kladde.toml")).expect("hard link creates");
+    kladde()
+        .args(["config", "set", "daily-folder", "Journal", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success();
+    assert_eq!(
+        fs::read_to_string(&victim).expect("victim reads"),
+        "stamp = false\n"
+    );
+    kladde()
+        .args(["config", "get", "daily-folder", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success()
+        .stdout("Journal\n");
+}
+
+/// A config write touches only its own temp entry: a bystander file
+/// with a temp-suffixed name survives untouched, symlink target
+/// included.
+#[cfg(unix)]
+#[test]
+fn config_set_leaves_a_bystander_temp_entry_alone() {
+    let (nb, outside) = (temp(), temp());
+    let victim = outside.path().join("victim.toml");
+    fs::write(&victim, "untouched\n").expect("fixture writes");
+    let bystander = nb.path().join(".kladde.toml.kladde-tmp");
+    std::os::unix::fs::symlink(&victim, &bystander).expect("symlink creates");
+    kladde()
+        .args(["config", "set", "daily-folder", "Journal", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success();
+    assert!(
+        fs::symlink_metadata(&bystander)
+            .expect("metadata reads")
+            .is_symlink()
+    );
+    assert_eq!(
+        fs::read_to_string(&victim).expect("victim reads"),
+        "untouched\n"
+    );
+    kladde()
+        .args(["config", "get", "daily-folder", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success()
+        .stdout("Journal\n");
+}
+
+/// Temp-suffixed names are kladde's own namespace, so a note command
+/// cannot create the file a config write would treat as its workspace.
+#[test]
+fn note_targets_cannot_use_the_temp_suffix() {
+    let (nb, state) = (temp(), temp());
+    for target in [".kladde.toml.kladde-tmp", "notes/x.KLADDE-TMP"] {
+        kladde_state(state.path())
+            .args(["new", target, "--notebook"])
+            .arg(nb.path())
+            .assert()
+            .code(1)
+            .stderr(contains("names a kladde temporary file, not a note"));
+    }
+    kladde_state(state.path())
+        .args(["append", "- x", ".kladde.toml.kladde-tmp", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .code(1)
+        .stderr(contains("names a kladde temporary file, not a note"));
+    assert!(!nb.path().join(".kladde.toml.kladde-tmp").exists());
+    assert!(!nb.path().join("notes").exists());
+}
+
+/// A symlinked base config keeps its link; the managed target receives
+/// the write.
+#[cfg(unix)]
+#[test]
+fn config_set_follows_a_symlinked_base_config() {
+    let (xdg, managed) = (temp(), temp());
+    let target = managed.path().join("managed.toml");
+    fs::write(&target, "editor = 'vim'\n").expect("fixture writes");
+    fs::create_dir_all(xdg.path().join("kladde")).expect("config dir creates");
+    std::os::unix::fs::symlink(&target, config_file(xdg.path())).expect("symlink creates");
+    kladde_in(xdg.path())
+        .args(["config", "set", "daily-folder", "Journal"])
+        .assert()
+        .success();
+    assert!(
+        fs::symlink_metadata(config_file(xdg.path()))
+            .expect("metadata reads")
+            .is_symlink()
+    );
+    let contents = fs::read_to_string(&target).expect("target reads");
+    assert!(contents.contains("editor = 'vim'"), "{contents}");
+    assert!(contents.contains("daily-folder"), "{contents}");
+}
+
+/// A link installed ahead of the file it manages keeps its link; the
+/// write creates the managed target.
+#[cfg(unix)]
+#[test]
+fn config_set_creates_the_target_of_a_dangling_base_link() {
+    let (xdg, managed) = (temp(), temp());
+    let target = managed.path().join("machine.toml");
+    fs::create_dir_all(xdg.path().join("kladde")).expect("config dir creates");
+    std::os::unix::fs::symlink(&target, config_file(xdg.path())).expect("symlink creates");
+    kladde_in(xdg.path())
+        .args(["config", "set", "daily-folder", "Journal"])
+        .assert()
+        .success();
+    assert!(
+        fs::symlink_metadata(config_file(xdg.path()))
+            .expect("metadata reads")
+            .is_symlink()
+    );
+    assert!(target.exists());
+    kladde_in(xdg.path())
+        .args(["config", "get", "daily-folder"])
+        .assert()
+        .success()
+        .stdout("Journal\n");
+}
+
+/// A dangling chain deeper than any real layout is refused: the rename
+/// would replace the link the walk stopped at.
+#[cfg(unix)]
+#[test]
+fn config_set_reports_a_link_chain_too_deep() {
+    let xdg = temp();
+    let config_dir = xdg.path().join("kladde");
+    fs::create_dir_all(&config_dir).expect("config dir creates");
+    let mut prev = config_dir.join("gone.toml");
+    for index in 0..8 {
+        let link = config_dir.join(format!("l{index}.toml"));
+        std::os::unix::fs::symlink(&prev, &link).expect("symlink creates");
+        prev = link;
+    }
+    std::os::unix::fs::symlink(&prev, config_file(xdg.path())).expect("symlink creates");
+    kladde_in(xdg.path())
+        .args(["config", "set", "daily-folder", "Journal"])
+        .assert()
+        .code(1)
+        .stderr(contains("too many levels of links"));
+}
+
+/// The Windows twin of the cycle refusal: a junction chain deeper than
+/// any real layout.
+#[cfg(windows)]
+#[test]
+fn config_set_reports_a_junction_chain_too_deep() {
+    let xdg = temp();
+    let config_dir = xdg.path().join("kladde");
+    fs::create_dir_all(&config_dir).expect("config dir creates");
+    let real = config_dir.join("real");
+    fs::create_dir(&real).expect("fixture dir creates");
+    let mut prev = real.clone();
+    for index in 0..8 {
+        let link = config_dir.join(format!("j{index}"));
+        link_dir(&link, &prev);
+        prev = link;
+    }
+    link_dir(&config_file(xdg.path()), &prev);
+    fs::remove_dir(&real).expect("target removes");
+    kladde_in(xdg.path())
+        .args(["config", "set", "daily-folder", "Journal"])
+        .assert()
+        .code(1)
+        .stderr(contains("too many levels of links"));
+}
+
+/// An unverifiable config entry is an error, never treated as absent.
+#[cfg(unix)]
+#[test]
+fn config_path_reports_an_unverifiable_notebook_config() {
+    use std::os::unix::fs::PermissionsExt;
+    let nb = temp();
+    fs::set_permissions(nb.path(), fs::Permissions::from_mode(0o000)).expect("permissions apply");
+    kladde()
+        .args(["config", "path", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .code(1)
+        .stderr(contains("cannot resolve"));
+    fs::set_permissions(nb.path(), fs::Permissions::from_mode(0o755)).expect("permissions restore");
+}
+
+/// A hard link to the config carries no reserved spelling, so identity
+/// settles it: neither a path target nor name lookup reaches the config
+/// through one.
+#[test]
+fn note_targets_cannot_reach_the_config_through_a_hard_link() {
+    let nb = temp();
+    fs::write(nb.path().join(".kladde.toml"), "stamp = false\n").expect("fixture writes");
+    fs::hard_link(nb.path().join(".kladde.toml"), nb.path().join("alias.md"))
+        .expect("hard link creates");
+    kladde()
+        .args(["read", "alias.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .code(1)
+        .stderr(contains("names the notebook config, not a note"));
+    kladde()
+        .args(["read", "--name", "alias", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .code(1)
+        .stderr(contains("names the notebook config, not a note"));
 }

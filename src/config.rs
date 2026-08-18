@@ -1,8 +1,9 @@
 //! Locating, loading, and editing kladde's configuration.
 
-use std::fs;
-use std::io::ErrorKind;
+use std::fs::{self, File};
+use std::io::{ErrorKind, Write};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use toml_edit::DocumentMut;
 
@@ -83,6 +84,30 @@ pub struct Config {
     pub bullet_indent: Option<structure::Indent>,
 }
 
+impl Config {
+    /// This config with `notebook`'s notebook-scoped keys layered over it:
+    /// a key set in both takes the notebook's value whole, so list values
+    /// replace rather than merge. The machine-scoped keys always keep this
+    /// config's values; [`load_notebook`] cannot produce them, so only a
+    /// hand-built `Config` could hold any.
+    #[must_use]
+    pub fn layered(self, notebook: Config) -> Config {
+        Config {
+            default_notebook: self.default_notebook,
+            editor: self.editor,
+            daily_folder: notebook.daily_folder.or(self.daily_folder),
+            daily_date_format: notebook.daily_date_format.or(self.daily_date_format),
+            daily_template: notebook.daily_template.or(self.daily_template),
+            stamp: notebook.stamp.or(self.stamp),
+            stamp_created_key: notebook.stamp_created_key.or(self.stamp_created_key),
+            stamp_updated_key: notebook.stamp_updated_key.or(self.stamp_updated_key),
+            stamp_format: notebook.stamp_format.or(self.stamp_format),
+            stamp_exclude: notebook.stamp_exclude.or(self.stamp_exclude),
+            bullet_indent: notebook.bullet_indent.or(self.bullet_indent),
+        }
+    }
+}
+
 /// Failure while reading, validating, or writing the config file.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -98,6 +123,10 @@ pub enum Error {
     },
     #[error("unknown key `{key}` in {}", path.display())]
     UnknownKey { path: PathBuf, key: String },
+    #[error("the notebook config {} sets `{key}`, which is machine-scoped", path.display())]
+    MachineKey { path: PathBuf, key: String },
+    #[error("in notebook config {}: {cause}", path.display())]
+    NotebookValue { path: PathBuf, cause: Box<Error> },
     #[error("`{key}` must be a string")]
     NotAString { key: &'static str },
     #[error("`{key}` must be an absolute path, got \"{value}\"")]
@@ -147,6 +176,18 @@ pub enum Error {
     },
 }
 
+/// File name of a notebook's own config, at the notebook root. The dot
+/// prefix keeps it invisible to note listing and name lookup.
+pub const NOTEBOOK_FILE: &str = ".kladde.toml";
+
+/// Whether `key` may only be set in the base config, never in a notebook
+/// config: a notebook that syncs between machines is data, so it must not
+/// choose the machine's notebook or supply commands kladde executes.
+#[must_use]
+pub fn machine_scoped(key: &str) -> bool {
+    matches!(key, DEFAULT_NOTEBOOK | EDITOR)
+}
+
 /// Directory holding kladde's configuration, following the XDG base directory
 /// convention on every platform: `$XDG_CONFIG_HOME/kladde`, falling back to
 /// `$HOME/.config/kladde`. As the XDG specification requires, a relative path
@@ -181,10 +222,46 @@ pub fn file(xdg_config_home: Option<PathBuf>, home: Option<PathBuf>) -> Option<P
 /// `daily-folder` must be a non-empty relative path, and
 /// `daily-date-format` must render a date.
 pub fn load(file: &Path) -> Result<Config, Error> {
+    parsed(file, false)
+}
+
+/// Reads and validates a notebook's own config file, with the same keys,
+/// shapes, and missing-file behavior as [`load`], except that
+/// machine-scoped keys are rejected.
+///
+/// # Errors
+///
+/// Returns an error in every case [`load`] does, and when the file sets a
+/// machine-scoped key. A value error is wrapped with the file's path,
+/// because by the time a notebook config loads there are two files a bad
+/// value could live in.
+pub fn load_notebook(file: &Path) -> Result<Config, Error> {
+    parsed(file, true).map_err(|error| match error {
+        error @ (Error::Read { .. }
+        | Error::Parse { .. }
+        | Error::UnknownKey { .. }
+        | Error::MachineKey { .. }) => error,
+        cause => Error::NotebookValue {
+            path: file.to_owned(),
+            cause: Box::new(cause),
+        },
+    })
+}
+
+/// The shared reader behind [`load`] and [`load_notebook`]: one set of
+/// per-key parse arms, with the machine-scoped rejection ahead of them
+/// when `notebook` is set.
+fn parsed(file: &Path, notebook: bool) -> Result<Config, Error> {
     let document = read_document(file)?;
     let mut config = Config::default();
     for (key, item) in document.iter() {
         match key {
+            key if notebook && machine_scoped(key) => {
+                return Err(Error::MachineKey {
+                    path: file.to_owned(),
+                    key: key.to_owned(),
+                });
+            }
             DEFAULT_NOTEBOOK => {
                 let value = item.as_str().ok_or(Error::NotAString {
                     key: DEFAULT_NOTEBOOK,
@@ -613,12 +690,94 @@ fn read_document(file: &Path) -> Result<DocumentMut, Error> {
     })
 }
 
-fn save(file: &Path, document: &DocumentMut) -> Result<(), Error> {
-    ensure_dir(file)?;
-    fs::write(file, document.to_string()).map_err(|cause| Error::Write {
+/// Counts this process's saves, so each gets its own temp file name.
+static SAVES: AtomicU64 = AtomicU64::new(0);
+
+/// The path a config write lands at: the canonical location when the
+/// entry resolves, otherwise the end of the dangling link chain, so a
+/// link installed ahead of the file it manages gets that file created.
+/// A chain still unresolved after the last hop is refused; renaming
+/// onto a link would replace it.
+fn write_target(file: &Path) -> Result<PathBuf, Error> {
+    let mut path = file.to_owned();
+    for _ in 0..8 {
+        if let Ok(canonical) = fs::canonicalize(&path) {
+            return Ok(canonical);
+        }
+        let Ok(target) = fs::read_link(&path) else {
+            return Ok(path);
+        };
+        let parent = path.parent().unwrap_or(&path).to_path_buf();
+        path = parent.join(target);
+    }
+    Err(Error::Write {
         path: file.to_owned(),
-        cause,
+        cause: std::io::Error::other("too many levels of links"),
     })
+}
+
+/// Discards the temp file this save created, best effort. On Windows a
+/// readonly temp would survive a plain remove, so the attribute is
+/// cleared first; only here, on a temp the exclusive create proved
+/// ours, never on a pre-existing entry.
+#[cfg(unix)]
+fn discard(temp: &Path) {
+    let _ = fs::remove_file(temp);
+}
+
+#[cfg(windows)]
+fn discard(temp: &Path) {
+    if let Ok(metadata) = fs::metadata(temp) {
+        let mut permissions = metadata.permissions();
+        permissions.set_readonly(false);
+        let _ = fs::set_permissions(temp, permissions);
+    }
+    let _ = fs::remove_file(temp);
+}
+
+/// Writes by temp-file-and-rename, like every note write: the entry is
+/// replaced, never written through, so a crash cannot tear the file and
+/// a hard link cannot carry the write to another inode. The target is
+/// resolved through [`write_target`], so a symlinked base config keeps
+/// its link. The temp is created exclusively under a hashed per-save
+/// name; process ids can collide across containers or hosts, and
+/// concurrent saves stay last-writer-wins. Permissions carry over; the
+/// temp is removed on failure, best effort.
+fn save(file: &Path, document: &DocumentMut) -> Result<(), Error> {
+    let file = write_target(file)?;
+    ensure_dir(&file)?;
+    let temp = file.with_file_name(format!(
+        ".{}.{}-{}{}",
+        crate::write::hashed(&file),
+        std::process::id(),
+        SAVES.fetch_add(1, Ordering::Relaxed),
+        crate::write::TEMP_SUFFIX
+    ));
+    let permissions = fs::metadata(&file)
+        .ok()
+        .map(|metadata| metadata.permissions());
+    // A stale leftover (pid reuse) is removed without touching its
+    // attributes; if it resists, the exclusive create fails.
+    let _ = fs::remove_file(&temp);
+    File::options()
+        .write(true)
+        .create_new(true)
+        .open(&temp)
+        .and_then(|mut created| {
+            if let Some(permissions) = permissions {
+                created.set_permissions(permissions)?;
+            }
+            created.write_all(document.to_string().as_bytes())?;
+            created.sync_all()
+        })
+        .and_then(|()| fs::rename(&temp, &file))
+        .map_err(|cause| {
+            discard(&temp);
+            Error::Write {
+                path: file.clone(),
+                cause,
+            }
+        })
 }
 
 #[cfg(test)]
@@ -861,6 +1020,31 @@ mod tests {
         assert!(error.to_string().contains("not a directory"));
     }
 
+    /// Unix allows renaming over a readonly file, like every note
+    /// write; the permissions carry over.
+    #[cfg(unix)]
+    #[test]
+    fn set_default_notebook_replaces_a_readonly_file() {
+        let base = temp();
+        let notebook = temp();
+        let file = base.path().join("config.toml");
+        fs::write(&file, "").expect("fixture writes");
+        set_readonly(&file, true);
+        set_default_notebook(&file, notebook.path()).expect("readonly entry is replaceable");
+        let config = load(&file).expect("written config loads");
+        assert_eq!(config.default_notebook, Some(notebook.path().to_owned()));
+        assert!(
+            fs::metadata(&file)
+                .expect("metadata reads")
+                .permissions()
+                .readonly()
+        );
+        set_readonly(&file, false);
+    }
+
+    /// Windows refuses to rename over a readonly file, so the write
+    /// fails loudly there.
+    #[cfg(windows)]
     #[test]
     fn set_default_notebook_reports_unwritable_file() {
         let base = temp();
@@ -871,6 +1055,201 @@ mod tests {
         let error = set_default_notebook(&file, notebook.path()).expect_err("readonly fails");
         assert!(error.to_string().contains("cannot write"));
         set_readonly(&file, false);
+        assert_eq!(temp_files(base.path()), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn set_default_notebook_reports_an_unwritable_directory() {
+        let base = temp();
+        let notebook = temp();
+        let file = base.path().join("config.toml");
+        fs::write(&file, "").expect("fixture writes");
+        set_readonly(base.path(), true);
+        let error = set_default_notebook(&file, notebook.path()).expect_err("readonly dir fails");
+        assert!(error.to_string().contains("cannot write"));
+        set_readonly(base.path(), false);
+        assert_eq!(temp_files(base.path()), 0);
+    }
+
+    /// The number of kladde temp files sitting in `dir`.
+    fn temp_files(dir: &Path) -> usize {
+        fs::read_dir(dir)
+            .expect("dir reads")
+            .filter(|entry| {
+                entry
+                    .as_ref()
+                    .expect("entry reads")
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".kladde-tmp")
+            })
+            .count()
+    }
+
+    #[test]
+    fn set_leaves_no_temp_file() {
+        let base = temp();
+        let file = base.path().join("config.toml");
+        set_editor(&file, "vim").expect("set succeeds");
+        assert_eq!(temp_files(base.path()), 0);
+    }
+
+    /// A link installed ahead of the file it manages keeps its link;
+    /// the write creates the missing target, absolute or link-relative.
+    #[cfg(unix)]
+    #[test]
+    fn set_creates_the_target_of_a_dangling_link() {
+        let base = temp();
+        let managed = temp();
+        let absolute = managed.path().join("machine.toml");
+        let file = base.path().join("config.toml");
+        std::os::unix::fs::symlink(&absolute, &file).expect("symlink creates");
+        set_editor(&file, "vim").expect("set succeeds");
+        assert!(
+            fs::symlink_metadata(&file)
+                .expect("metadata reads")
+                .is_symlink()
+        );
+        assert!(
+            fs::read_to_string(&absolute)
+                .expect("target reads")
+                .contains("editor")
+        );
+        let relative = base.path().join("other.toml");
+        std::os::unix::fs::symlink("managed/other.toml", &relative).expect("symlink creates");
+        set_editor(&relative, "vim").expect("set succeeds");
+        assert!(base.path().join("managed").join("other.toml").exists());
+    }
+
+    /// A junction: created while its target exists, so chains can be
+    /// built link by link and left dangling by removing the one real
+    /// directory at the end.
+    #[cfg(windows)]
+    fn junction(link: &Path, target: &Path) {
+        let cmd = format!(
+            "{}\\System32\\cmd.exe",
+            std::env::var("SYSTEMROOT").expect("SYSTEMROOT is set on Windows")
+        );
+        let status = std::process::Command::new(cmd)
+            .args(["/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .status()
+            .expect("mklink runs");
+        assert!(status.success());
+    }
+
+    /// The Windows twin of the dangling-link walk, through a junction
+    /// whose target directory is gone.
+    #[cfg(windows)]
+    #[test]
+    fn set_creates_the_target_of_a_dangling_junction() {
+        let base = temp();
+        let managed = temp();
+        let target = managed.path().join("gone");
+        fs::create_dir(&target).expect("fixture dir creates");
+        let file = base.path().join("config.toml");
+        junction(&file, &target);
+        fs::remove_dir(&target).expect("target removes");
+        set_editor(&file, "vim").expect("set succeeds");
+        assert!(
+            fs::read_to_string(&target)
+                .expect("target reads")
+                .contains("editor")
+        );
+    }
+
+    /// Two links installed ahead of the managed file both survive, and
+    /// the write creates the file at the chain's end.
+    #[cfg(unix)]
+    #[test]
+    fn set_follows_a_dangling_link_chain() {
+        let base = temp();
+        let managed = temp();
+        let file = base.path().join("config.toml");
+        let middle = managed.path().join("middle.toml");
+        let target = managed.path().join("final.toml");
+        std::os::unix::fs::symlink(&target, &middle).expect("symlink creates");
+        std::os::unix::fs::symlink(&middle, &file).expect("symlink creates");
+        set_editor(&file, "vim").expect("set succeeds");
+        assert!(
+            fs::symlink_metadata(&middle)
+                .expect("metadata reads")
+                .is_symlink()
+        );
+        assert!(target.exists());
+    }
+
+    /// A dangling chain deeper than any real layout is refused; the
+    /// rename would replace the link the walk stopped at. A cycle
+    /// fails earlier, at the read, with the operating system's error.
+    #[cfg(unix)]
+    #[test]
+    fn set_reports_a_link_chain_too_deep() {
+        let base = temp();
+        let mut prev = base.path().join("gone.toml");
+        for index in 0..8 {
+            let link = base.path().join(format!("l{index}.toml"));
+            std::os::unix::fs::symlink(&prev, &link).expect("symlink creates");
+            prev = link;
+        }
+        let file = base.path().join("config.toml");
+        std::os::unix::fs::symlink(&prev, &file).expect("symlink creates");
+        let error = set_editor(&file, "vim").expect_err("deep chain fails");
+        assert!(
+            error.to_string().contains("too many levels of links"),
+            "{error}"
+        );
+    }
+
+    /// The Windows twin of the cycle refusal: a junction chain deeper
+    /// than any real layout.
+    #[cfg(windows)]
+    #[test]
+    fn set_reports_a_junction_chain_too_deep() {
+        let base = temp();
+        let real = base.path().join("real");
+        fs::create_dir(&real).expect("fixture dir creates");
+        let mut prev = real.clone();
+        for index in 0..8 {
+            let link = base.path().join(format!("j{index}"));
+            junction(&link, &prev);
+            prev = link;
+        }
+        let file = base.path().join("config.toml");
+        junction(&file, &prev);
+        fs::remove_dir(&real).expect("target removes");
+        let error = set_editor(&file, "vim").expect_err("deep chain fails");
+        assert!(
+            error.to_string().contains("too many levels of links"),
+            "{error}"
+        );
+    }
+
+    /// A symlinked base config is followed: the link survives and the
+    /// managed target receives the write.
+    #[cfg(unix)]
+    #[test]
+    fn set_follows_a_symlinked_config() {
+        let base = temp();
+        let managed = temp();
+        let target = managed.path().join("managed.toml");
+        fs::write(&target, "editor = 'vim'\n").expect("fixture writes");
+        let file = base.path().join("config.toml");
+        std::os::unix::fs::symlink(&target, &file).expect("symlink creates");
+        set_daily_folder(&file, "Journal").expect("set succeeds");
+        assert!(
+            fs::symlink_metadata(&file)
+                .expect("metadata reads")
+                .is_symlink()
+        );
+        let contents = fs::read_to_string(&target).expect("target reads");
+        assert!(contents.contains("editor = 'vim'"), "{contents}");
+        assert!(
+            contents.contains("daily-folder = \"Journal\""),
+            "{contents}"
+        );
     }
 
     #[cfg(unix)]
@@ -1413,5 +1792,187 @@ mod tests {
         set_stamp_exclude(&file, "..").expect_err("escaping entry fails");
         set_stamp_exclude(&file, ".").expect_err("escaping entry fails");
         assert!(!file.exists());
+    }
+
+    #[test]
+    fn machine_scoped_names_only_the_machine_keys() {
+        assert!(machine_scoped(DEFAULT_NOTEBOOK));
+        assert!(machine_scoped(EDITOR));
+        for key in [
+            DAILY_FOLDER,
+            DAILY_DATE_FORMAT,
+            DAILY_TEMPLATE,
+            STAMP,
+            STAMP_CREATED_KEY,
+            STAMP_UPDATED_KEY,
+            STAMP_FORMAT,
+            STAMP_EXCLUDE,
+            BULLET_INDENT,
+        ] {
+            assert!(!machine_scoped(key), "{key} is notebook-scoped");
+        }
+    }
+
+    #[test]
+    fn load_notebook_reads_every_notebook_scoped_key() {
+        let base = temp();
+        let file = base.path().join(NOTEBOOK_FILE);
+        fs::write(
+            &file,
+            "daily-folder = 'Journal'\n\
+             daily-date-format = '%Y/%m/%d'\n\
+             daily-template = 'templates/Daily.md'\n\
+             stamp = false\n\
+             stamp-created-key = 'made'\n\
+             stamp-updated-key = 'touched'\n\
+             stamp-format = '%Y-%m-%d'\n\
+             stamp-exclude = ['templates']\n\
+             bullet-indent = 'spaces'\n",
+        )
+        .expect("fixture writes");
+        let config = load_notebook(&file).expect("fixture loads");
+        assert_eq!(config.daily_folder, Some(PathBuf::from("Journal")));
+        assert_eq!(
+            config.daily_date_format,
+            Some(day::Format::new("%Y/%m/%d").expect("format builds"))
+        );
+        assert_eq!(
+            config.daily_template,
+            Some(PathBuf::from("templates/Daily.md"))
+        );
+        assert_eq!(config.stamp, Some(false));
+        assert_eq!(config.stamp_created_key, Some("made".to_owned()));
+        assert_eq!(config.stamp_updated_key, Some("touched".to_owned()));
+        assert_eq!(
+            config.stamp_format,
+            Some(day::StampFormat::new("%Y-%m-%d").expect("format builds"))
+        );
+        assert_eq!(config.stamp_exclude, Some(vec![PathBuf::from("templates")]));
+        assert_eq!(config.bullet_indent, Some(structure::Indent::Spaces));
+    }
+
+    #[test]
+    fn load_notebook_returns_empty_config_when_file_missing() {
+        let base = temp();
+        let config = load_notebook(&base.path().join(NOTEBOOK_FILE)).expect("missing file loads");
+        assert_eq!(config, Config::default());
+    }
+
+    #[test]
+    fn load_notebook_rejects_machine_scoped_keys() {
+        let base = temp();
+        let file = base.path().join(NOTEBOOK_FILE);
+        for (contents, key) in [
+            ("editor = 'vim'\n", "editor"),
+            ("default-notebook = '/notes'\n", "default-notebook"),
+        ] {
+            fs::write(&file, contents).expect("fixture writes");
+            let message = load_notebook(&file)
+                .expect_err("machine key fails")
+                .to_string();
+            assert!(message.contains(".kladde.toml"), "{message}");
+            assert!(
+                message.contains(&format!("sets `{key}`, which is machine-scoped")),
+                "{message}"
+            );
+        }
+    }
+
+    /// Errors that already name the file pass through unwrapped, so the
+    /// path never appears twice in one message.
+    #[test]
+    fn load_notebook_passes_file_errors_through_unwrapped() {
+        let base = temp();
+        let file = base.path().join(NOTEBOOK_FILE);
+        fs::write(&file, "editor = [oops\n").expect("fixture writes");
+        let parse = load_notebook(&file).expect_err("garbage does not parse");
+        assert!(parse.to_string().starts_with("invalid TOML in"));
+        fs::write(&file, "unknown = 1\n").expect("fixture writes");
+        let unknown = load_notebook(&file).expect_err("unknown key fails");
+        assert!(unknown.to_string().starts_with("unknown key `unknown`"));
+        fs::remove_file(&file).expect("fixture removes");
+        fs::create_dir(&file).expect("obstacle creates");
+        let read = load_notebook(&file).expect_err("directory does not read");
+        assert!(read.to_string().starts_with("cannot read"));
+    }
+
+    #[test]
+    fn load_notebook_wraps_a_value_error_with_the_path() {
+        let base = temp();
+        let file = base.path().join(NOTEBOOK_FILE);
+        fs::write(&file, "daily-folder = ''\n").expect("fixture writes");
+        let message = load_notebook(&file)
+            .expect_err("empty folder fails")
+            .to_string();
+        assert!(message.starts_with("in notebook config"), "{message}");
+        assert!(message.contains(".kladde.toml"), "{message}");
+        assert!(
+            message.contains("`daily-folder` must not be empty"),
+            "{message}"
+        );
+    }
+
+    /// A config with every key set, one side of the layering tests.
+    fn base_config() -> Config {
+        Config {
+            default_notebook: Some(abs("/machine")),
+            editor: Some("vim".to_owned()),
+            daily_folder: Some(PathBuf::from("base")),
+            daily_date_format: Some(day::Format::new("%Y").expect("format builds")),
+            daily_template: Some(PathBuf::from("base.md")),
+            stamp: Some(true),
+            stamp_created_key: Some("base-created".to_owned()),
+            stamp_updated_key: Some("base-updated".to_owned()),
+            stamp_format: Some(day::StampFormat::new("%Y").expect("format builds")),
+            stamp_exclude: Some(vec![PathBuf::from("base")]),
+            bullet_indent: Some(structure::Indent::Tab),
+        }
+    }
+
+    /// A config setting every notebook-scoped key, differing from
+    /// [`base_config`] in each.
+    fn notebook_config() -> Config {
+        Config {
+            default_notebook: None,
+            editor: None,
+            daily_folder: Some(PathBuf::from("nb")),
+            daily_date_format: Some(day::Format::new("%d").expect("format builds")),
+            daily_template: Some(PathBuf::from("nb.md")),
+            stamp: Some(false),
+            stamp_created_key: Some("nb-created".to_owned()),
+            stamp_updated_key: Some("nb-updated".to_owned()),
+            stamp_format: Some(day::StampFormat::new("%H").expect("format builds")),
+            stamp_exclude: Some(vec![PathBuf::from("nb")]),
+            bullet_indent: Some(structure::Indent::Spaces),
+        }
+    }
+
+    #[test]
+    fn layered_takes_the_notebook_value_for_keys_set_in_both() {
+        let layered = base_config().layered(notebook_config());
+        let expected = Config {
+            default_notebook: Some(abs("/machine")),
+            editor: Some("vim".to_owned()),
+            ..notebook_config()
+        };
+        assert_eq!(layered, expected);
+    }
+
+    #[test]
+    fn layered_falls_back_to_the_base_for_unset_keys() {
+        assert_eq!(base_config().layered(Config::default()), base_config());
+    }
+
+    /// Only a hand-built notebook config can hold machine keys, but the
+    /// contract stands: layering never takes them.
+    #[test]
+    fn layered_keeps_machine_keys_from_the_base() {
+        let layered = Config::default().layered(base_config());
+        let expected = Config {
+            default_notebook: None,
+            editor: None,
+            ..base_config()
+        };
+        assert_eq!(layered, expected);
     }
 }

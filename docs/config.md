@@ -1,7 +1,8 @@
 # Configuration
 
-Kladde is configured via a single TOML file. Every key is optional, and so is
-the file itself. A missing file is an empty config.
+Kladde is configured via a TOML file, and a notebook may carry its own that
+overrides it key by key. Every key is optional, and so are the files themselves.
+A missing file is an empty config.
 
 ## Location
 
@@ -98,7 +99,7 @@ to `stamp-exclude` to keep the template note itself unstamped.
 Whether kladde stamps the notes it writes: a created property added when kladde
 creates a note's frontmatter block, and an updated property refreshed on every
 write that changes the note. Unset means `true`; set it to `false` to turn
-stamping off on this machine.
+stamping off.
 
 ### `stamp-created-key`
 
@@ -131,6 +132,19 @@ bullet's own text starts, the indent CommonMark asks of a nested item: `tab`
 gets there with tabs, `spaces` with spaces. A bullet that already has a child is
 not affected by this key: kladde copies that child's indent, so a note keeps its
 own style. Unset means `tab`.
+
+## Notebook config
+
+A notebook can carry its own config in a `.kladde.toml` file at its root, in the
+same format. A key set in both files takes the notebook's value; a
+`stamp-exclude` list replaces the base one. `default-notebook` and `editor`
+cannot be set in a notebook config.
+
+The config commands take `--notebook` to target a notebook's config:
+`kladde config set daily-folder Journal --notebook ~/notes` writes into that
+notebook's `.kladde.toml`. `get` prints what the file holds, not the merged
+result; `open` uses the editor from the base config; `unset` works on any key,
+so it can remove one added by hand.
 
 ## Commands
 

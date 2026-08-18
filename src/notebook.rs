@@ -33,8 +33,14 @@ pub enum Error {
     },
     #[error("\"{}\" escapes the notebook", target.display())]
     Escape { target: PathBuf },
+    #[error("\"{}\" names the notebook config, not a note", target.display())]
+    ReservedTarget { target: PathBuf },
+    #[error("\"{}\" names a kladde temporary file, not a note", target.display())]
+    TempTarget { target: PathBuf },
     #[error("not a file: {}", path.display())]
     NotAFile { path: PathBuf },
+    #[error("the notebook config {} is not a regular file", path.display())]
+    ConfigNotRegular { path: PathBuf },
     #[error("no note named \"{name}\"")]
     NoSuchName { name: String },
     #[error("multiple notes named \"{name}\": {}", list(matches))]
@@ -45,6 +51,23 @@ fn resolve_error(path: &Path) -> impl FnOnce(std::io::Error) -> Error + '_ {
     move |cause| Error::Resolve {
         path: path.to_owned(),
         cause,
+    }
+}
+
+/// Probes `path` for resolution: its metadata when an entry exists,
+/// `None` when it is creatably absent (missing, or below a file where a
+/// directory would be needed). Any other failure means the entry cannot
+/// be verified, and an unverified entry joins no proof.
+fn probed(path: &Path) -> Result<Option<fs::Metadata>, Error> {
+    match path.symlink_metadata() {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(cause) if matches!(cause.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) => {
+            Ok(None)
+        }
+        Err(cause) => Err(Error::Resolve {
+            path: path.to_owned(),
+            cause,
+        }),
     }
 }
 
@@ -153,8 +176,11 @@ impl Notebook {
     /// Returns an error when `target` is rooted, empty, or steps outside
     /// the notebook (`..`, or a link that resolves outside), when a
     /// component or link cannot be verified, when the target is not a
-    /// file, or when a non-directory sits where a parent directory is
-    /// needed.
+    /// file, when a non-directory sits where a parent directory is
+    /// needed, when the target names or resolves at or under the
+    /// notebook's own config file, which is not a note, or when its file
+    /// name carries kladde's temporary-file suffix, which is not a note
+    /// name.
     pub fn note(&self, target: &Path) -> Result<NotePath, Error> {
         if target.has_root() {
             return Err(Error::NotRelative {
@@ -176,6 +202,8 @@ impl Notebook {
         if names.is_empty() {
             return Err(Error::EmptyTarget);
         }
+        let spelled = reserved_name(names[0]);
+        let spelled_temp = names.last().copied().is_some_and(temp_suffixed);
         let mut existing = self.root.clone();
         let mut remainder = PathBuf::new();
         for name in names {
@@ -184,19 +212,9 @@ impl Notebook {
                 continue;
             }
             let probe = existing.join(name);
-            match probe.symlink_metadata() {
-                Ok(_) => existing.push(name),
-                // A missing entry starts the creatable remainder; so does a
-                // file where a directory would be needed, which the
-                // creatability check below turns into a clear error. Any
-                // other failure means the component cannot be verified, and
-                // an unverified component must not become part of the proof.
-                Err(cause)
-                    if matches!(cause.kind(), ErrorKind::NotFound | ErrorKind::NotADirectory) =>
-                {
-                    remainder.push(name);
-                }
-                Err(cause) => return Err(Error::Resolve { path: probe, cause }),
+            match probed(&probe)? {
+                Some(_) => existing.push(name),
+                None => remainder.push(name),
             }
         }
         let resolved = fs::canonicalize(&existing).map_err(resolve_error(&existing))?;
@@ -205,22 +223,48 @@ impl Notebook {
                 target: target.to_owned(),
             });
         }
-        if remainder.as_os_str().is_empty() {
+        let absolute = if remainder.as_os_str().is_empty() {
             if !resolved.is_file() {
                 return Err(Error::NotAFile { path: resolved });
             }
-            Ok(NotePath {
-                absolute: resolved,
-                root: self.root.clone(),
-            })
+            resolved
         } else if resolved.is_dir() {
-            Ok(NotePath {
-                absolute: resolved.join(remainder),
-                root: self.root.clone(),
-            })
+            resolved.join(remainder)
         } else {
-            Err(Error::NotADirectory { path: resolved })
+            return Err(Error::NotADirectory { path: resolved });
+        };
+        if spelled || reserved(&absolute, &self.root) || config_aliased(&absolute, &self.root) {
+            return Err(Error::ReservedTarget {
+                target: target.to_owned(),
+            });
         }
+        if spelled_temp || absolute.file_name().is_some_and(temp_suffixed) {
+            return Err(Error::TempTarget {
+                target: target.to_owned(),
+            });
+        }
+        Ok(NotePath {
+            absolute,
+            root: self.root.clone(),
+        })
+    }
+
+    /// The notebook's own config file at the root; missing loads as an
+    /// empty config. An existing entry must be a regular file: a link is
+    /// never followed, and a pipe would block a read forever.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the entry exists but is not a regular file,
+    /// or when it cannot be verified at all. The verdict is
+    /// point-in-time, like every resolution proof: a caller racing its
+    /// own filesystem must tolerate staleness.
+    pub fn config_file(&self) -> Result<PathBuf, Error> {
+        let path = self.root.join(crate::config::NOTEBOOK_FILE);
+        if probed(&path)?.is_some_and(|metadata| !metadata.is_file()) {
+            return Err(Error::ConfigNotRegular { path });
+        }
+        Ok(path)
     }
 
     /// The daily note for `date`: the date rendered through `format` plus
@@ -253,7 +297,8 @@ impl Notebook {
     /// # Errors
     ///
     /// Returns an error when `name` is empty, when no note or several
-    /// notes match, or when a folder cannot be read while searching.
+    /// notes match, when a folder cannot be read while searching, or
+    /// when the matched note is the notebook config under another name.
     pub fn find(&self, name: &str) -> Result<NotePath, Error> {
         let stem = name.strip_suffix(".md").unwrap_or(name);
         if stem.is_empty() {
@@ -271,10 +316,16 @@ impl Notebook {
             });
         }
         match matches.pop() {
-            Some(found) => Ok(NotePath {
-                absolute: self.root.join(found),
-                root: self.root.clone(),
-            }),
+            Some(found) => {
+                let absolute = self.root.join(&found);
+                if config_aliased(&absolute, &self.root) {
+                    return Err(Error::ReservedTarget { target: found });
+                }
+                Ok(NotePath {
+                    absolute,
+                    root: self.root.clone(),
+                })
+            }
             None => Err(Error::NoSuchName {
                 name: stem.to_owned(),
             }),
@@ -315,6 +366,48 @@ fn walk(dir: &Path, rel: &Path, notes: &mut Vec<PathBuf>) -> Result<(), Error> {
         }
     }
     Ok(())
+}
+
+/// Whether a single name is the notebook config's, compared case-folded
+/// so a spelling that aliases it on a case-insensitive filesystem is
+/// caught before it exists. One expression, so a non-Unicode name simply
+/// fails the match.
+fn reserved_name(name: &OsStr) -> bool {
+    name.to_str()
+        .is_some_and(|name| UniCase::new(name) == UniCase::new(crate::config::NOTEBOOK_FILE))
+}
+
+/// Whether a file name carries kladde's temporary-file suffix,
+/// lowercased so a case-insensitive alias counts. Writes may clear
+/// stale temp entries, so a note must never occupy one.
+fn temp_suffixed(name: &OsStr) -> bool {
+    name.to_str()
+        .is_some_and(|name| name.to_lowercase().ends_with(crate::write::TEMP_SUFFIX))
+}
+
+/// Whether the resolved note is the notebook's config file by identity,
+/// which is all a hard link shares with it. The comparison opens both
+/// files, so it runs only when the config stats as a regular file; a
+/// pipe's open would block forever. A failed check reads as "not the
+/// config".
+fn config_aliased(absolute: &Path, root: &Path) -> bool {
+    let config = root.join(crate::config::NOTEBOOK_FILE);
+    config
+        .symlink_metadata()
+        .is_ok_and(|metadata| metadata.is_file())
+        && same_file::is_same_file(absolute, &config).unwrap_or(false)
+}
+
+/// Whether the resolved path lies at or under the notebook's own config
+/// file: the first component of the notebook-relative path carries the
+/// reserved name. The config file must be a regular file or absent, so
+/// nothing can legitimately live below that name either.
+fn reserved(absolute: &Path, root: &Path) -> bool {
+    absolute
+        .strip_prefix(root)
+        .ok()
+        .and_then(|relative| relative.components().next())
+        .is_some_and(|component| reserved_name(component.as_os_str()))
 }
 
 /// Whether the path's stem matches `wanted` under Unicode case folding.
@@ -800,5 +893,278 @@ mod tests {
             .note(Path::new("alias/x.md"))
             .expect("inside link resolves");
         assert_eq!(note.as_path(), canonical(&root).join("real").join("x.md"));
+    }
+
+    #[test]
+    fn note_rejects_the_notebook_config() {
+        let root = temp();
+        let error = notebook(&root)
+            .note(Path::new(".kladde.toml"))
+            .expect_err("reserved name fails");
+        assert_eq!(
+            error.to_string(),
+            "\".kladde.toml\" names the notebook config, not a note"
+        );
+        fs::write(root.path().join(".kladde.toml"), "stamp = false\n").expect("fixture writes");
+        notebook(&root)
+            .note(Path::new(".kladde.toml"))
+            .expect_err("the existing file is reserved too");
+    }
+
+    /// The comparison folds case, so a spelling that would alias the
+    /// config file on a case-insensitive filesystem is rejected on every
+    /// platform, before anything exists.
+    #[test]
+    fn note_rejects_a_case_alias_of_the_notebook_config() {
+        let root = temp();
+        let error = notebook(&root)
+            .note(Path::new(".KLADDE.TOML"))
+            .expect_err("case alias fails");
+        assert!(
+            error.to_string().contains("names the notebook config"),
+            "{error}"
+        );
+    }
+
+    /// Only the root-level name is reserved; deeper down it is an
+    /// ordinary dot file.
+    #[test]
+    fn note_resolves_a_nested_kladde_toml() {
+        let root = temp();
+        let note = notebook(&root)
+            .note(Path::new("sub/.kladde.toml"))
+            .expect("nested dot file resolves");
+        assert_eq!(
+            note.as_path(),
+            canonical(&root).join("sub").join(".kladde.toml")
+        );
+    }
+
+    /// A link elsewhere in the notebook resolving to the config file is
+    /// caught by the same comparison, since resolution canonicalizes.
+    #[cfg(unix)]
+    #[test]
+    fn note_rejects_a_link_alias_of_the_notebook_config() {
+        let root = temp();
+        fs::write(root.path().join(".kladde.toml"), "").expect("fixture writes");
+        std::os::unix::fs::symlink(
+            root.path().join(".kladde.toml"),
+            root.path().join("alias.md"),
+        )
+        .expect("symlink creates");
+        let error = notebook(&root)
+            .note(Path::new("alias.md"))
+            .expect_err("link alias fails");
+        assert!(
+            error.to_string().contains("names the notebook config"),
+            "{error}"
+        );
+    }
+
+    /// Temp names are kladde's implementation namespace at any depth, in
+    /// any case; a name merely containing the suffix mid-name is fine.
+    #[test]
+    fn note_rejects_a_temporary_file_name() {
+        let root = temp();
+        let opened = notebook(&root);
+        for target in [
+            ".kladde.toml.kladde-tmp",
+            "x.KLADDE-TMP",
+            "sub/.abc123.kladde-tmp",
+        ] {
+            let error = opened.note(Path::new(target)).expect_err("temp name fails");
+            assert_eq!(
+                error.to_string(),
+                format!("\"{target}\" names a kladde temporary file, not a note")
+            );
+        }
+        opened
+            .note(Path::new("kladde-tmp.md"))
+            .expect("a name without the dotted suffix resolves");
+        opened
+            .note(Path::new("x.kladde-tmp.md"))
+            .expect("a name containing the suffix mid-name resolves");
+    }
+
+    /// A link resolving to a temp name is caught like the spelled form.
+    #[cfg(unix)]
+    #[test]
+    fn note_rejects_a_link_alias_of_a_temporary_file() {
+        let root = temp();
+        fs::write(root.path().join(".x.kladde-tmp"), "").expect("fixture writes");
+        std::os::unix::fs::symlink(
+            root.path().join(".x.kladde-tmp"),
+            root.path().join("alias.md"),
+        )
+        .expect("symlink creates");
+        let error = notebook(&root)
+            .note(Path::new("alias.md"))
+            .expect_err("link alias fails");
+        assert!(
+            error.to_string().contains("names a kladde temporary file"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn config_file_is_the_root_kladde_toml() {
+        let root = temp();
+        let opened = notebook(&root);
+        let path = opened.config_file().expect("a missing entry is fine");
+        assert_eq!(path, canonical(&root).join(".kladde.toml"));
+        fs::write(&path, "stamp = false\n").expect("fixture writes");
+        assert_eq!(opened.config_file().expect("a regular file is fine"), path);
+    }
+
+    #[test]
+    fn config_file_rejects_a_link() {
+        let root = temp();
+        let target = temp();
+        link_dir(&root.path().join(".kladde.toml"), target.path());
+        let error = notebook(&root).config_file().expect_err("link fails");
+        assert!(
+            error.to_string().contains("is not a regular file"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn config_file_rejects_a_directory() {
+        let root = temp();
+        fs::create_dir(root.path().join(".kladde.toml")).expect("fixture dir creates");
+        let error = notebook(&root).config_file().expect_err("directory fails");
+        assert!(
+            error.to_string().contains("is not a regular file"),
+            "{error}"
+        );
+    }
+
+    /// A pipe would block the config read forever waiting for a writer,
+    /// so it is rejected before anything reads it.
+    #[cfg(unix)]
+    #[test]
+    fn config_file_rejects_a_fifo() {
+        let root = temp();
+        let status = std::process::Command::new("mkfifo")
+            .arg(root.path().join(".kladde.toml"))
+            .status()
+            .expect("mkfifo runs");
+        assert!(status.success());
+        let error = notebook(&root).config_file().expect_err("fifo fails");
+        assert!(
+            error.to_string().contains("is not a regular file"),
+            "{error}"
+        );
+    }
+
+    /// The reserved name covers everything under it too; nothing can
+    /// legitimately live below the config file.
+    #[test]
+    fn note_rejects_targets_under_the_notebook_config() {
+        let root = temp();
+        for target in [".kladde.toml/x.md", ".KLADDE.TOML/sub/x.md"] {
+            let error = notebook(&root)
+                .note(Path::new(target))
+                .expect_err("nested target fails");
+            assert!(
+                error.to_string().contains("names the notebook config"),
+                "{error}"
+            );
+        }
+    }
+
+    /// The spelling is reserved before resolution, so a link at the
+    /// reserved name cannot make the name readable as the note it points
+    /// to.
+    #[cfg(unix)]
+    #[test]
+    fn note_rejects_the_reserved_spelling_of_an_inside_link() {
+        let root = temp();
+        fs::write(root.path().join("real.md"), "").expect("fixture writes");
+        std::os::unix::fs::symlink(
+            root.path().join("real.md"),
+            root.path().join(".kladde.toml"),
+        )
+        .expect("symlink creates");
+        let error = notebook(&root)
+            .note(Path::new(".kladde.toml"))
+            .expect_err("reserved spelling fails");
+        assert!(
+            error.to_string().contains("names the notebook config"),
+            "{error}"
+        );
+    }
+
+    /// An unverifiable entry is an error, never treated as absent.
+    #[cfg(unix)]
+    #[test]
+    fn config_file_reports_an_unverifiable_entry() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = temp();
+        let opened = notebook(&root);
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o000))
+            .expect("permissions apply");
+        let error = opened.config_file().expect_err("unverifiable entry fails");
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o755))
+            .expect("permissions restore");
+        assert!(error.to_string().contains("cannot resolve"), "{error}");
+    }
+
+    /// A hard link to the config carries no reserved spelling and
+    /// canonicalization keeps the alias name, so identity settles it.
+    #[test]
+    fn note_rejects_a_hard_link_alias_of_the_notebook_config() {
+        let root = temp();
+        fs::write(root.path().join(".kladde.toml"), "stamp = false\n").expect("fixture writes");
+        fs::hard_link(
+            root.path().join(".kladde.toml"),
+            root.path().join("alias.md"),
+        )
+        .expect("hard link creates");
+        let error = notebook(&root)
+            .note(Path::new("alias.md"))
+            .expect_err("hard link alias fails");
+        assert!(
+            error.to_string().contains("names the notebook config"),
+            "{error}"
+        );
+    }
+
+    /// The identity check opens the config, and opening a pipe blocks
+    /// forever, so an irregular config entry skips the check: explicit
+    /// note resolution never touches it.
+    #[cfg(unix)]
+    #[test]
+    fn note_resolution_ignores_a_fifo_notebook_config() {
+        let root = temp();
+        fs::write(root.path().join("x.md"), "").expect("fixture writes");
+        let status = std::process::Command::new("mkfifo")
+            .arg(root.path().join(".kladde.toml"))
+            .status()
+            .expect("mkfifo runs");
+        assert!(status.success());
+        let opened = notebook(&root);
+        opened
+            .note(Path::new("x.md"))
+            .expect("resolution returns promptly");
+        opened.find("x").expect("lookup returns promptly");
+    }
+
+    #[test]
+    fn find_rejects_a_hard_link_alias_of_the_notebook_config() {
+        let root = temp();
+        fs::write(root.path().join(".kladde.toml"), "stamp = false\n").expect("fixture writes");
+        fs::hard_link(
+            root.path().join(".kladde.toml"),
+            root.path().join("alias.md"),
+        )
+        .expect("hard link creates");
+        let error = notebook(&root)
+            .find("alias")
+            .expect_err("hard link alias fails");
+        assert!(
+            error.to_string().contains("names the notebook config"),
+            "{error}"
+        );
     }
 }
