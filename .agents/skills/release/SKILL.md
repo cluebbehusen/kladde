@@ -58,6 +58,10 @@ with OIDC.
   `Cargo.toml` and `pyproject.toml` and fail before uploading anything.
 - Tag pushed with no draft waiting: the host job fails. Create the draft, then
   re-run the failed job from the run page.
+- Host job failed after uploading some assets: a plain re-run hits "asset
+  already exists" errors, because its upload does not overwrite. Delete the
+  uploaded assets first (`gh release delete-asset vX.Y.Z <name>` per file, or
+  delete and recreate the draft), then re-run the failed job.
 - Registry auth failures also happen before any upload. Fix the cause and re-run
   the failed job from the run page rather than re-tagging.
 - Partial publication: the crates.io and PyPI jobs are independent, so one
