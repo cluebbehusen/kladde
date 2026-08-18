@@ -19,6 +19,55 @@ Because Kladde writes pure markdown files, it is compatible with any markdown
 editor. For example, Kladde can be used to write to your Obsidian vault simply
 by pointing Kladde at the vault folder.
 
+## Installation
+
+Kladde can be used through uv without durably installing it:
+
+```sh
+uvx kladde --help
+```
+
+Or it can be installed durably, with the shell installer:
+
+```sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/cluebbehusen/kladde/releases/latest/download/kladde-installer.sh | sh
+```
+
+with the PowerShell installer on Windows:
+
+```powershell
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/cluebbehusen/kladde/releases/latest/download/kladde-installer.ps1 | iex"
+```
+
+or from crates.io or PyPI:
+
+```sh
+cargo install kladde
+uv tool install kladde # or: pipx install kladde
+```
+
+## Quickstart
+
+Point Kladde at a folder and write:
+
+```sh
+kladde config set default-notebook ~/notes
+kladde append "## Decisions"
+kladde append "- Chose blue-green deploys: instant rollback" --under Decisions
+kladde read
+```
+
+The first append creates today's daily note; the second lands under the heading
+it just wrote. `kladde --help` lists every command.
+
+But Kladde's main audience is coding agents. Install the skill:
+
+```sh
+npx skills add cluebbehusen/kladde
+```
+
+Then ask your coding agent what Kladde can do and how it can be configured.
+
 ## Frontmatter
 
 Kladde reads and edits a note's frontmatter, the YAML properties block at the

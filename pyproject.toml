@@ -1,0 +1,28 @@
+[project]
+name = "kladde"
+version = "0.1.0"
+description = "CLI for a local markdown notebook, built for coding agents: daily notes, generic notes, and section-aware appends that are safe under concurrent writers"
+requires-python = ">=3.9"
+license = "MIT"
+readme = "README.md"
+authors = [{ name = "Connor Luebbehusen", email = "connor@luebbehusen.dev" }]
+keywords = ["markdown", "notes", "notebook", "daily-notes", "agent"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "Environment :: Console",
+  "Programming Language :: Rust",
+  "Topic :: Text Processing :: Markup :: Markdown",
+]
+
+[project.urls]
+Homepage = "https://github.com/cluebbehusen/kladde"
+Source = "https://github.com/cluebbehusen/kladde"
+Issues = "https://github.com/cluebbehusen/kladde/issues"
+
+[build-system]
+requires = ["maturin>=1.14,<2.0"]
+build-backend = "maturin"
+
+[tool.maturin]
+bindings = "bin"
+strip = true

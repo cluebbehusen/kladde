@@ -47,3 +47,11 @@ enforcing 100% line coverage from unit tests alone and from integration tests
 alone. Clippy runs with `pedantic` warnings enabled and `-D warnings` so
 warnings fail the build; fix the code rather than suppressing the lint, and give
 any justified `#[allow]` a short reason on the same line.
+
+A change that touches a skill must also pass the skills validator on every skill
+directory, which CI runs as well:
+
+```
+uvx --from skills-ref==0.1.1 agentskills validate skills/kladde
+uvx --from skills-ref==0.1.1 agentskills validate .agents/skills/release
+```

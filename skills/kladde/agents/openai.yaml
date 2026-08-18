@@ -1,0 +1,3 @@
+interface:
+  display_name: "Kladde"
+  short_description: "Maintain a local markdown notebook with the Kladde CLI"
