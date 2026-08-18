@@ -1,6 +1,6 @@
 [package]
 name = "kladde"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.89"
 description = "CLI for a local markdown notebook, built for coding agents: daily notes, generic notes, and section-aware appends that are safe under concurrent writers"
