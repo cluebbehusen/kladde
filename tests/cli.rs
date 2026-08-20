@@ -5482,6 +5482,20 @@ fn writes_report_a_broken_config_despite_a_path_target() {
         .assert()
         .code(1)
         .stderr(contains("invalid TOML"));
+    kladde_in(xdg.path())
+        .env("XDG_STATE_HOME", state.path())
+        .args(["remove", "--match", "x", "x.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .code(1)
+        .stderr(contains("invalid TOML"));
+    kladde_in(xdg.path())
+        .env("XDG_STATE_HOME", state.path())
+        .args(["check", "--match", "x", "x.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .code(1)
+        .stderr(contains("invalid TOML"));
     assert!(!nb.path().join("x.md").exists());
 }
 
@@ -6370,4 +6384,689 @@ fn note_targets_cannot_reach_the_config_through_a_hard_link() {
         .assert()
         .code(1)
         .stderr(contains("names the notebook config, not a note"));
+}
+
+/// Runs `remove` with stamping off against `x.md` holding `contents`,
+/// passing `--match` and the scope `args`, and returns the assertion.
+fn remove_from(
+    nb: &TempDir,
+    state: &TempDir,
+    xdg: &TempDir,
+    contents: &str,
+    matched: &str,
+    args: &[&str],
+) -> assert_cmd::assert::Assert {
+    fs::write(nb.path().join("x.md"), contents).expect("fixture writes");
+    let mut command = kladde_unstamped(state.path(), xdg.path());
+    command
+        .args(["remove", "--match", matched, "x.md"])
+        .args(args)
+        .arg("--notebook")
+        .arg(nb.path());
+    command.assert()
+}
+
+#[test]
+fn remove_takes_the_matched_bullet() {
+    let nb = temp();
+    let state = temp();
+    let xdg = temp();
+    remove_from(&nb, &state, &xdg, "- one\n- two\n- three\n", "two", &[]).success();
+    assert_eq!(x_contents(&nb), "- one\n- three\n");
+}
+
+#[test]
+fn remove_scopes_with_headings_and_bullets() {
+    let nb = temp();
+    let state = temp();
+    let xdg = temp();
+    remove_from(
+        &nb,
+        &state,
+        &xdg,
+        "# A\n- p\n\t- keep\n\t- drop\n# B\n- p\n\t- drop\n",
+        "drop",
+        &["--under", "A", "--under-bullet", "p"],
+    )
+    .success();
+    assert_eq!(x_contents(&nb), "# A\n- p\n\t- keep\n# B\n- p\n\t- drop\n");
+}
+
+#[test]
+fn remove_reports_unmatched_and_invalid_targets() {
+    let nb = temp();
+    let state = temp();
+    let xdg = temp();
+    let cases = [
+        ("- x\n", "y", &[][..], "no bullet matching \"y\""),
+        (
+            "- x\n- xy\n",
+            "x",
+            &[][..],
+            "multiple bullets matching \"x\"",
+        ),
+        (
+            "- x\n",
+            "x",
+            &["--under", "A"][..],
+            "no heading matching \"A\"",
+        ),
+        ("- x\n", "", &[][..], "invalid bullet \"\": it is empty"),
+        (
+            "- drop\n\t- child\n",
+            "drop",
+            &[][..],
+            "the bullet matching \"drop\" holds nested content",
+        ),
+        (
+            "- drop\n  more text\n",
+            "drop",
+            &[][..],
+            "the bullet matching \"drop\" holds nested content",
+        ),
+        (
+            "- - child\n- keep\n",
+            "- child",
+            &[][..],
+            "the bullet matching \"- child\" holds nested content",
+        ),
+        (
+            "- - child\n- keep\n",
+            "child",
+            &[][..],
+            "the bullet matching \"child\" shares its line with another bullet",
+        ),
+        (
+            "- a\n\n- b\n",
+            "b",
+            &[][..],
+            "the removal would change the structure around it",
+        ),
+        (
+            "- a\n\n- b\n\ntail\n",
+            "b",
+            &[][..],
+            "the removal would change the structure around it",
+        ),
+        (
+            "- drop\n---\nk: v\n---\n",
+            "drop",
+            &[][..],
+            "the removal would change the structure around it",
+        ),
+        (
+            "- notes\n\t```\n\tlet a = 1;\n- scratch\n\n\n",
+            "scratch",
+            &[][..],
+            "the removal would change the structure around it",
+        ),
+        (
+            "- a\r- b\r",
+            "b",
+            &[][..],
+            "the note uses bare carriage-return line endings",
+        ),
+    ];
+    for (contents, matched, args, fragment) in cases {
+        remove_from(&nb, &state, &xdg, contents, matched, args)
+            .code(1)
+            .stderr(contains(fragment));
+        assert_eq!(x_contents(&nb), contents, "for {matched:?} {args:?}");
+    }
+}
+
+/// The cut takes exactly the named line: every blank the note held
+/// stays where it was.
+#[test]
+fn remove_takes_only_the_named_line() {
+    let nb = temp();
+    let state = temp();
+    let xdg = temp();
+    remove_from(&nb, &state, &xdg, "## A\n\n- solo\n\ntext\n", "solo", &[]).success();
+    assert_eq!(x_contents(&nb), "## A\n\n\ntext\n");
+}
+
+#[test]
+fn remove_takes_a_loose_middle_item() {
+    let nb = temp();
+    let state = temp();
+    let xdg = temp();
+    remove_from(&nb, &state, &xdg, "- a\n\n- b\n\n- c\n", "b", &[]).success();
+    assert_eq!(x_contents(&nb), "- a\n\n\n- c\n");
+}
+
+/// A last item's span holds the blank after its list; the blank
+/// separator survives the cut.
+#[test]
+fn remove_takes_the_last_item_before_a_heading() {
+    let nb = temp();
+    let state = temp();
+    let xdg = temp();
+    remove_from(&nb, &state, &xdg, "## S\n\n- x\n- y\n\n## Next\n", "y", &[]).success();
+    assert_eq!(x_contents(&nb), "## S\n\n- x\n\n## Next\n");
+}
+
+/// The primary agent workflow: an appended entry can be retracted, and
+/// the note comes back byte-identical.
+#[test]
+fn remove_round_trips_an_appended_entry() {
+    let nb = temp();
+    let state = temp();
+    let xdg = temp();
+    let original = "#### Thoughts\n\n#### Stream\n";
+    fs::write(nb.path().join("x.md"), original).expect("fixture writes");
+    kladde_unstamped(state.path(), xdg.path())
+        .args([
+            "append",
+            "- a thought",
+            "x.md",
+            "--under",
+            "Thoughts",
+            "--notebook",
+        ])
+        .arg(nb.path())
+        .assert()
+        .success();
+    kladde_unstamped(state.path(), xdg.path())
+        .args([
+            "remove",
+            "--match",
+            "a thought",
+            "x.md",
+            "--under",
+            "Thoughts",
+            "--notebook",
+        ])
+        .arg(nb.path())
+        .assert()
+        .success();
+    assert_eq!(x_contents(&nb), original);
+}
+
+/// A cut that would promote a nested blank into a top-level separator
+/// reshapes untouched siblings, so it is refused.
+#[test]
+fn remove_refuses_promoting_a_nested_blank() {
+    let nb = temp();
+    let state = temp();
+    let xdg = temp();
+    let text = "- a\n\t- b\n\n\t- b2\n\n\t- zd\n- last\n";
+    remove_from(&nb, &state, &xdg, text, "zd", &[])
+        .code(1)
+        .stderr(contains("the removal would change the structure around it"));
+    assert_eq!(x_contents(&nb), text);
+}
+
+/// A bullet whose own text spells a heading vanishes with the cut
+/// like anything else on the removed line.
+#[test]
+fn remove_takes_a_bullet_spelling_a_heading() {
+    let nb = temp();
+    let state = temp();
+    let xdg = temp();
+    remove_from(
+        &nb,
+        &state,
+        &xdg,
+        "- # of retries hit 3\n- next\n",
+        "# of retries",
+        &[],
+    )
+    .success();
+    assert_eq!(x_contents(&nb), "- next\n");
+}
+
+/// Container spans wobble with indent and terminator ownership across
+/// a cut; content edges see past both.
+#[test]
+fn remove_reads_span_wobble() {
+    let nb = temp();
+    let state = temp();
+    let xdg = temp();
+    remove_from(&nb, &state, &xdg, "- a\n  - b\n  1. x\n", "b", &[]).success();
+    assert_eq!(x_contents(&nb), "- a\n  1. x\n");
+    remove_from(
+        &nb,
+        &state,
+        &xdg,
+        "## S\n\n- Session A\n\t- did x\n\n  wrap up line\n",
+        "did x",
+        &[],
+    )
+    .success();
+    assert_eq!(x_contents(&nb), "## S\n\n- Session A\n\n  wrap up line\n");
+}
+
+/// A mixed-marker thread round-trips: the appended entry can be
+/// retracted even next to a differently-marked sibling list.
+#[test]
+fn remove_takes_a_mixed_marker_sibling() {
+    let nb = temp();
+    let state = temp();
+    let xdg = temp();
+    let original = "- Session A\n\t1. reviewed the PR\n";
+    fs::write(nb.path().join("x.md"), original).expect("fixture writes");
+    kladde_unstamped(state.path(), xdg.path())
+        .args([
+            "append",
+            "- shipped it",
+            "x.md",
+            "--under-bullet",
+            "Session A",
+            "--notebook",
+        ])
+        .arg(nb.path())
+        .assert()
+        .success();
+    kladde_unstamped(state.path(), xdg.path())
+        .args([
+            "remove",
+            "--match",
+            "shipped it",
+            "x.md",
+            "--under-bullet",
+            "Session A",
+            "--notebook",
+        ])
+        .arg(nb.path())
+        .assert()
+        .success();
+    assert_eq!(x_contents(&nb), original);
+}
+
+/// Cutting an ordered list's first item promotes the next marker to
+/// the list's start: sequential lists render unchanged and pass,
+/// gapped ones renumber and are refused.
+#[test]
+fn remove_guards_ordered_list_starts() {
+    let nb = temp();
+    let state = temp();
+    let xdg = temp();
+    remove_from(&nb, &state, &xdg, "1. one\n2. two\n3. three\n", "one", &[]).success();
+    assert_eq!(x_contents(&nb), "2. two\n3. three\n");
+    remove_from(
+        &nb,
+        &state,
+        &xdg,
+        "1. keep\n2. drop\n3. later\n",
+        "drop",
+        &[],
+    )
+    .success();
+    assert_eq!(x_contents(&nb), "1. keep\n3. later\n");
+    remove_from(&nb, &state, &xdg, "1. drop\n1. keep\n", "drop", &[]).success();
+    assert_eq!(x_contents(&nb), "1. keep\n");
+    remove_from(&nb, &state, &xdg, "- > - child\n- keep\n", "> - child", &[]).success();
+    assert_eq!(x_contents(&nb), "- keep\n");
+    let gapped = "1. zdrop\n5. five\n7. seven\n";
+    remove_from(&nb, &state, &xdg, gapped, "zdrop", &[])
+        .code(1)
+        .stderr(contains("the removal would change the structure around it"));
+    assert_eq!(x_contents(&nb), gapped);
+}
+
+/// A missing note reads as empty, where no bullet can match, so the
+/// removal fails rather than create a note.
+#[test]
+fn remove_on_a_missing_note_creates_nothing() {
+    let nb = temp();
+    let state = temp();
+    let xdg = temp();
+    kladde_unstamped(state.path(), xdg.path())
+        .args(["remove", "--match", "x", "missing.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .code(1)
+        .stderr(contains("no bullet matching \"x\""));
+    assert!(!nb.path().join("missing.md").exists());
+}
+
+/// A removal never materializes the daily template: a missing daily
+/// reads as empty and the match fails first, broken template or not.
+#[test]
+fn remove_with_a_broken_template_creates_no_daily() {
+    let (nb, state, xdg) = (temp(), temp(), temp());
+    kladde_templated(state.path(), xdg.path())
+        .args([
+            "remove",
+            "--match",
+            "x",
+            "--date",
+            "2026-01-05",
+            "--notebook",
+        ])
+        .arg(nb.path())
+        .assert()
+        .code(1)
+        .stderr(contains("no bullet matching \"x\""));
+    assert!(!nb.path().join("2026-01-05.md").exists());
+}
+
+#[test]
+fn remove_defaults_to_the_dated_daily_note() {
+    let nb = temp();
+    let state = temp();
+    let xdg = temp();
+    fs::write(nb.path().join("2026-01-05.md"), "- keep\n- drop\n").expect("fixture writes");
+    kladde_unstamped(state.path(), xdg.path())
+        .args([
+            "remove",
+            "--match",
+            "drop",
+            "--date",
+            "2026-01-05",
+            "--notebook",
+        ])
+        .arg(nb.path())
+        .assert()
+        .success();
+    assert_eq!(dated_contents(&nb), "- keep\n");
+}
+
+#[test]
+fn remove_finds_a_note_by_name() {
+    let nb = temp();
+    let state = temp();
+    let xdg = temp();
+    let folder = nb.path().join("notes");
+    fs::create_dir_all(&folder).expect("fixture dir creates");
+    fs::write(folder.join("apple.md"), "- keep\n- drop\n").expect("fixture writes");
+    kladde_unstamped(state.path(), xdg.path())
+        .args(["remove", "--match", "drop", "--name", "apple", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success();
+    let note = fs::read_to_string(folder.join("apple.md")).expect("note reads");
+    assert_eq!(note, "- keep\n");
+}
+
+#[test]
+fn remove_stamps_the_write() {
+    let nb = temp();
+    let state = temp();
+    fs::write(nb.path().join("x.md"), "- a\n- b\n").expect("fixture writes");
+    kladde_state(state.path())
+        .args(["remove", "--match", "b", "x.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success();
+    let note = x_contents(&nb);
+    assert!(note.starts_with("---\ncreated: "), "in {note}");
+    assert!(note.contains("\nupdated: "), "in {note}");
+    assert!(note.ends_with("---\n- a\n"), "in {note}");
+}
+
+#[test]
+fn remove_keeps_a_crlf_note_crlf() {
+    let nb = temp();
+    let state = temp();
+    let xdg = temp();
+    remove_from(
+        &nb,
+        &state,
+        &xdg,
+        "## A\r\n\r\n- one\r\n- two\r\n",
+        "two",
+        &["--under", "A"],
+    )
+    .success();
+    assert_eq!(x_contents(&nb), "## A\r\n\r\n- one\r\n");
+}
+
+#[test]
+fn remove_accepts_hyphen_match_values() {
+    let nb = temp();
+    let state = temp();
+    let xdg = temp();
+    remove_from(&nb, &state, &xdg, "- -flag\n- keep\n", "-flag", &[]).success();
+    assert_eq!(x_contents(&nb), "- keep\n");
+}
+
+#[test]
+fn remove_fails_without_state_base() {
+    let nb = temp();
+    kladde()
+        .args(["remove", "--match", "x", "x.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .code(1)
+        .stderr(contains("cannot locate the state directory"));
+}
+
+/// Runs `check` or `uncheck` with stamping off against `x.md` holding
+/// `contents`, passing `--match` and the scope `args`.
+fn toggle_in(
+    nb: &TempDir,
+    state: &TempDir,
+    xdg: &TempDir,
+    command: &str,
+    contents: &str,
+    matched: &str,
+    args: &[&str],
+) -> assert_cmd::assert::Assert {
+    fs::write(nb.path().join("x.md"), contents).expect("fixture writes");
+    let mut command_line = kladde_unstamped(state.path(), xdg.path());
+    command_line
+        .args([command, "--match", matched, "x.md"])
+        .args(args)
+        .arg("--notebook")
+        .arg(nb.path());
+    command_line.assert()
+}
+
+#[test]
+fn check_flips_the_matched_task() {
+    let nb = temp();
+    let state = temp();
+    let xdg = temp();
+    toggle_in(
+        &nb,
+        &state,
+        &xdg,
+        "check",
+        "- [ ] milk\n- [ ] bob\n",
+        "milk",
+        &[],
+    )
+    .success();
+    assert_eq!(x_contents(&nb), "- [x] milk\n- [ ] bob\n");
+}
+
+/// The match names the task's text past the box, so the same match
+/// checks a task and unchecks it again.
+#[test]
+fn uncheck_flips_back_with_the_same_match() {
+    let nb = temp();
+    let state = temp();
+    let xdg = temp();
+    toggle_in(&nb, &state, &xdg, "check", "- [ ] milk\n", "milk", &[]).success();
+    let checked = x_contents(&nb);
+    assert_eq!(checked, "- [x] milk\n");
+    kladde_unstamped(state.path(), xdg.path())
+        .args(["uncheck", "--match", "milk", "x.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success();
+    assert_eq!(x_contents(&nb), "- [ ] milk\n");
+}
+
+#[test]
+fn check_scopes_with_headings_and_bullets() {
+    let nb = temp();
+    let state = temp();
+    let xdg = temp();
+    toggle_in(
+        &nb,
+        &state,
+        &xdg,
+        "check",
+        "# A\n- p\n\t- [ ] t\n# B\n- p\n\t- [ ] t\n",
+        "t",
+        &["--under", "A", "--under-bullet", "p"],
+    )
+    .success();
+    assert_eq!(
+        x_contents(&nb),
+        "# A\n- p\n\t- [x] t\n# B\n- p\n\t- [ ] t\n"
+    );
+}
+
+#[test]
+fn check_reports_unmatched_and_invalid_targets() {
+    let nb = temp();
+    let state = temp();
+    let xdg = temp();
+    let cases = [
+        ("- t\n", "t", &[][..], "no task matching \"t\""),
+        ("- [ ]\n", "t", &[][..], "no task matching \"t\""),
+        ("- [x]t\n", "t", &[][..], "no task matching \"t\""),
+        (
+            "- [ ] t\n- [x] tu\n",
+            "t",
+            &[][..],
+            "multiple tasks matching \"t\"",
+        ),
+        (
+            "- [ ] t\n",
+            "t",
+            &["--under", "A"][..],
+            "no heading matching \"A\"",
+        ),
+        ("- [ ] t\n", "", &[][..], "invalid bullet \"\": it is empty"),
+        (
+            "- [ ] t\r",
+            "t",
+            &[][..],
+            "the note uses bare carriage-return line endings",
+        ),
+    ];
+    for (contents, matched, args, fragment) in cases {
+        toggle_in(&nb, &state, &xdg, "check", contents, matched, args)
+            .code(1)
+            .stderr(contains(fragment));
+        assert_eq!(x_contents(&nb), contents, "for {matched:?} {args:?}");
+    }
+}
+
+/// A task already in the asked state is success without a write, so
+/// the updated stamp stays put.
+#[test]
+fn check_of_a_checked_task_bumps_nothing() {
+    let nb = temp();
+    let state = temp();
+    let text = "---\ncreated: old\nupdated: old\n---\n- [x] t\n";
+    fs::write(nb.path().join("x.md"), text).expect("fixture writes");
+    kladde_state(state.path())
+        .args(["check", "--match", "t", "x.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success();
+    assert_eq!(x_contents(&nb), text);
+}
+
+#[test]
+fn check_stamps_a_real_flip() {
+    let nb = temp();
+    let state = temp();
+    fs::write(nb.path().join("x.md"), "- [ ] t\n").expect("fixture writes");
+    kladde_state(state.path())
+        .args(["check", "--match", "t", "x.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .success();
+    let note = x_contents(&nb);
+    assert!(note.starts_with("---\ncreated: "), "in {note}");
+    assert!(note.ends_with("---\n- [x] t\n"), "in {note}");
+}
+
+#[test]
+fn check_on_a_missing_note_creates_nothing() {
+    let nb = temp();
+    let state = temp();
+    let xdg = temp();
+    kladde_unstamped(state.path(), xdg.path())
+        .args(["check", "--match", "t", "missing.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .code(1)
+        .stderr(contains("no task matching \"t\""));
+    assert!(!nb.path().join("missing.md").exists());
+}
+
+/// A flip never materializes the daily template: a missing daily reads
+/// as empty and the match fails first, broken template or not.
+#[test]
+fn check_with_a_broken_template_creates_no_daily() {
+    let (nb, state, xdg) = (temp(), temp(), temp());
+    kladde_templated(state.path(), xdg.path())
+        .args([
+            "check",
+            "--match",
+            "t",
+            "--date",
+            "2026-01-05",
+            "--notebook",
+        ])
+        .arg(nb.path())
+        .assert()
+        .code(1)
+        .stderr(contains("no task matching \"t\""));
+    assert!(!nb.path().join("2026-01-05.md").exists());
+}
+
+#[test]
+fn check_fails_without_state_base() {
+    let nb = temp();
+    kladde()
+        .args(["check", "--match", "t", "x.md", "--notebook"])
+        .arg(nb.path())
+        .assert()
+        .code(1)
+        .stderr(contains("cannot locate the state directory"));
+}
+
+/// Whitespace after the box is separator, not text: a tab or extra
+/// spaces never have to be spelled in the match.
+#[test]
+fn check_reads_separator_whitespace() {
+    let nb = temp();
+    let state = temp();
+    let xdg = temp();
+    toggle_in(
+        &nb,
+        &state,
+        &xdg,
+        "check",
+        "- [ ]\tship it\n",
+        "ship it",
+        &[],
+    )
+    .success();
+    assert_eq!(x_contents(&nb), "- [x]\tship it\n");
+    toggle_in(
+        &nb,
+        &state,
+        &xdg,
+        "check",
+        "- [ ]  ship it\n",
+        "ship it",
+        &[],
+    )
+    .success();
+    assert_eq!(x_contents(&nb), "- [x]  ship it\n");
+}
+
+/// A wide gap after the marker makes the rest of the line indented
+/// code inside the item; a box the parser reads as code is content,
+/// never a task.
+#[test]
+fn check_skips_a_boxed_code_sample() {
+    let nb = temp();
+    let state = temp();
+    let xdg = temp();
+    let text = "-     [ ] code sample\n";
+    toggle_in(&nb, &state, &xdg, "check", text, "code sample", &[])
+        .code(1)
+        .stderr(contains("no task matching \"code sample\""));
+    assert_eq!(x_contents(&nb), text);
 }

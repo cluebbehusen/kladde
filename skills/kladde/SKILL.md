@@ -2,10 +2,10 @@
 name: kladde
 description:
   "Use the kladde CLI to maintain a local markdown notebook: record decisions
-  and discoveries in daily notes, append under headings or bullets, read or
-  search notes, and edit frontmatter or configuration. Use when the user or
-  project instructions ask for durable notes to be captured, retrieved, or
-  organized with kladde."
+  and discoveries in daily notes, append under headings or bullets, check off or
+  retract recorded entries, read or search notes, and edit frontmatter or
+  configuration. Use when the user or project instructions ask for durable notes
+  to be captured, retrieved, or organized with kladde."
 ---
 
 # kladde
@@ -55,6 +55,18 @@ Group related entries as a parent bullet with children:
 kladde append "- Chose per-key cache versioning" --under Decisions
 kladde append "- Versioned keys permit rollback" --under Decisions --under-bullet "Chose per-key"
 ```
+
+## Editing entries
+
+- `kladde check --match "<text>"` and `kladde uncheck --match "<text>"` flip a
+  task's box. A task is a bullet starting `[ ]` or `[x]`; the match is a prefix
+  of its text past the box, so the same match works before and after checking. A
+  task already in the asked state is left alone, which is success.
+- `kladde remove --match "<text>"` retracts one bullet, matched like
+  `--under-bullet`. A bullet holding nested content is refused rather than taken
+  with it.
+- All three scope with `--under` and `--under-bullet`, match exactly one target
+  or fail, and never create a missing note.
 
 ## Other commands
 

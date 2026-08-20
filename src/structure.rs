@@ -81,6 +81,16 @@ pub enum Error {
     BareCarriageReturn,
     #[error("the entry would change the structure around it")]
     AbsorbedStructure,
+    #[error("the bullet matching \"{}\" holds nested content", query.escape_debug())]
+    NestedContent { query: String },
+    #[error("the removal would change the structure around it")]
+    RemovalReshapes,
+    #[error("no task matching \"{}\"", query.escape_debug())]
+    NoTask { query: String },
+    #[error("multiple tasks matching \"{}\"", query.escape_debug())]
+    AmbiguousTask { query: String },
+    #[error("the bullet matching \"{}\" shares its line with another bullet", query.escape_debug())]
+    SharedLine { query: String },
 }
 
 /// `text` with `entry` landed at the place `placement` names: the end of
@@ -189,7 +199,7 @@ fn assembled(base: &str, prefixed: bool, suffixed: bool, eol: &str) -> String {
 enum BlockKind {
     Paragraph,
     Heading(HeadingLevel),
-    List,
+    List(Option<u64>),
     Item,
     Code,
     Html,
@@ -210,7 +220,7 @@ fn blocks(body: &str) -> Vec<(BlockKind, usize, Range<usize>)> {
                 let kind = match tag {
                     Tag::Paragraph => BlockKind::Paragraph,
                     Tag::Heading { level, .. } => BlockKind::Heading(level),
-                    Tag::List(_) => BlockKind::List,
+                    Tag::List(start) => BlockKind::List(start),
                     Tag::Item => BlockKind::Item,
                     Tag::CodeBlock(_) => BlockKind::Code,
                     Tag::HtmlBlock => BlockKind::Html,
@@ -352,6 +362,19 @@ fn parents_kept(
         .all(|(start, parent)| real.iter().any(|pair| pair == &(*start, *parent)))
 }
 
+/// Whether a surviving block keeps its kind. An ordered list whose
+/// first item was cut takes its start from the next item's marker, so
+/// its survivors renumber downward or hold, the way deleting from a
+/// numbered list does everywhere; only a raised number reshapes.
+fn kind_kept(before: BlockKind, after: BlockKind, first_cut: bool) -> bool {
+    match (before, after) {
+        (BlockKind::List(Some(start)), BlockKind::List(Some(new))) if first_cut => {
+            new <= start.saturating_add(1)
+        }
+        _ => before == after,
+    }
+}
+
 /// Each heading's parent: the start of the nearest earlier heading with
 /// a shallower level, or none at the top of the outline.
 fn parented(headings: &[(HeadingLevel, usize)]) -> Vec<(usize, Option<usize>)> {
@@ -379,6 +402,293 @@ fn appended(current: &str, entry: &str) -> String {
     new.push_str(entry);
     new.push('\n');
     new
+}
+
+/// `text` with the one bullet `query` names removed: its own line cut
+/// out, never its thread. The bullet is matched inside the scope the
+/// placement names, by a prefix of its first line past its marker, the
+/// same contract an appended entry's target follows; the placement's
+/// indent is insertion's concern and is ignored here. A bullet holding
+/// content beyond its first line, or another addressable bullet on it,
+/// is refused rather than taken with it, and so is a bullet sharing
+/// its line with the parent that opened it; the line itself goes
+/// whole, whatever blocks its own text parses into, a spelled heading
+/// or a quoted remark alike. Cutting an ordered item renumbers the
+/// items after it downward, the way deleting from a numbered list does
+/// everywhere; a cut that would raise a survivor's rendered number is
+/// refused instead.
+///
+/// # Errors
+///
+/// Returns an error when a query is empty or spans lines, when the
+/// scope or `query` matches no bullet or more than one, when the
+/// matched bullet holds nested content or shares its line, when the
+/// removal would change the structure around what it removes, or when
+/// the note uses bare carriage-return line endings.
+pub fn removed(text: &str, query: &str, scope: &Placement) -> Result<String, Error> {
+    for heading in &scope.headings {
+        validated(heading, Kind::Heading)?;
+    }
+    for bullet in &scope.bullets {
+        validated(bullet, Kind::Bullet)?;
+    }
+    validated(query, Kind::Bullet)?;
+    if bare_carriage_return(text) {
+        return Err(Error::BareCarriageReturn);
+    }
+    let body_start = frontmatter::body_start(text);
+    let body = &text[body_start..];
+    let outline = outline(body);
+    let range = edit_scope(body, &outline, scope)?;
+    let index = one_bullet(body, &outline, &range, query)?;
+    let bullet = &outline.bullets[index];
+    let start = line_start(body, content_start(body, &bullet.span));
+    let line_end = start + line_len(&body[start..]);
+    // A child can open on the marker line itself, so nested bullets
+    // are detected structurally, not by what follows the first line.
+    let within = interior(body, bullet);
+    if outline
+        .bullets
+        .iter()
+        .enumerate()
+        .any(|(other, child)| other != index && contains(&within, body, &child.span))
+    {
+        return Err(Error::NestedContent {
+            query: query.to_owned(),
+        });
+    }
+    if line_end < bullet.span.end && !blank(&body[line_end..bullet.span.end]) {
+        return Err(Error::NestedContent {
+            query: query.to_owned(),
+        });
+    }
+    // A marker-line child shares its line with its parent; cutting the
+    // line would take a bullet the query never named.
+    if content_start(body, &(start..line_end)) != content_start(body, &bullet.span) {
+        return Err(Error::SharedLine {
+            query: query.to_owned(),
+        });
+    }
+    // The cut takes exactly the named line, never a neighbor or a
+    // blank separator, and must leave the surroundings meaning what
+    // they meant; where it cannot, the removal is refused.
+    let before = blocks(body);
+    let candidate = excised(text, body_start + start..body_start + line_end);
+    if removal_kept(&candidate, &before, body, body_start, &(start..line_end)) {
+        return Ok(candidate);
+    }
+    Err(Error::RemovalReshapes)
+}
+
+/// `text` with the one task `query` names checked or unchecked: the
+/// box's state character flipped in place, nothing else touched. A
+/// task is a bullet whose text starts with `[ ]`, `[x]`, or `[X]`;
+/// `query` is a prefix of the task's text past the box, so the same
+/// query matches before and after checking, and only task bullets are
+/// candidates. A task already in the asked state comes back unchanged.
+/// The flip is a same-length edit of inline text, which cannot change
+/// the parse, so no structural check applies.
+///
+/// # Errors
+///
+/// Returns an error when a query is empty or spans lines, when the
+/// scope matches no heading or bullet or more than one, when `query`
+/// matches no task or more than one, or when the note uses bare
+/// carriage-return line endings.
+pub fn toggled(text: &str, query: &str, scope: &Placement, checked: bool) -> Result<String, Error> {
+    for heading in &scope.headings {
+        validated(heading, Kind::Heading)?;
+    }
+    for bullet in &scope.bullets {
+        validated(bullet, Kind::Bullet)?;
+    }
+    validated(query, Kind::Bullet)?;
+    if bare_carriage_return(text) {
+        return Err(Error::BareCarriageReturn);
+    }
+    let body_start = frontmatter::body_start(text);
+    let body = &text[body_start..];
+    let outline = outline(body);
+    let range = edit_scope(body, &outline, scope)?;
+    // A wide gap after the marker makes the rest of the line indented
+    // code inside the item; a box the parser reads as code is content,
+    // never a task.
+    let code: Vec<Range<usize>> = blocks(body)
+        .into_iter()
+        .filter_map(|(kind, _, span)| matches!(kind, BlockKind::Code).then_some(span))
+        .collect();
+    let mut found = None;
+    for bullet in &outline.bullets {
+        if !contains(&range, body, &bullet.span) {
+            continue;
+        }
+        let Some((task, state)) = task_text(bullet_line(body, bullet)) else {
+            continue;
+        };
+        let at = content_start(body, &bullet.span) + state;
+        if code.iter().any(|span| span.contains(&at)) {
+            continue;
+        }
+        if !task.starts_with(query) {
+            continue;
+        }
+        if found.is_some() {
+            return Err(Error::AmbiguousTask {
+                query: query.to_owned(),
+            });
+        }
+        found = Some(body_start + at);
+    }
+    let Some(at) = found else {
+        return Err(Error::NoTask {
+            query: query.to_owned(),
+        });
+    };
+    let current = text.as_bytes()[at];
+    let done = current == b'x' || current == b'X';
+    if done == checked {
+        return Ok(text.to_owned());
+    }
+    let mut new = text.to_owned();
+    new.replace_range(at..=at, if checked { "x" } else { " " });
+    Ok(new)
+}
+
+/// The text of a task line past its box, with the byte offset of the
+/// box's state character from the line's start: a task's text begins
+/// `[ ]`, `[x]`, or `[X]` directly past the marker, followed by
+/// whitespace or the line's end. The whitespace after the box is
+/// separator, not text, so a query never has to spell it. Any other
+/// line is no task.
+fn task_text(line: &str) -> Option<(&str, usize)> {
+    let text = bullet_text(line);
+    let state = line.len() - text.len() + 1;
+    let rest = text
+        .strip_prefix('[')?
+        .strip_prefix([' ', 'x', 'X'])?
+        .strip_prefix(']')?;
+    if rest.is_empty() {
+        return Some((rest, state));
+    }
+    let task = rest.trim_start_matches([' ', '\t']);
+    if task.len() == rest.len() {
+        return None;
+    }
+    Some((task, state))
+}
+
+/// The note with `range` cut out.
+fn excised(text: &str, range: Range<usize>) -> String {
+    let mut new = String::with_capacity(text.len() - range.len());
+    new.push_str(&text[..range.start]);
+    new.push_str(&text[range.end..]);
+    new
+}
+
+/// Checks an excised note against the blocks of the original body.
+/// Block spans shed and absorb neighboring blank lines and indent as
+/// whitespace ownership shifts across an edit, so blocks compare by
+/// their content edges: a block whose content sits inside the removed
+/// range vanishes with it, and every other block survives with kind,
+/// depth, and its known content edges intact. A straddling container
+/// whose content begins or ends on the removed line takes its new
+/// edge from a surviving child, so that side goes unpinned; an
+/// ordered list losing its first item renumbers by exactly one; code
+/// and raw HTML render their whitespace, so their spans must survive
+/// byte-exact. Nothing may appear that was not there, and every
+/// remaining heading keeps the parent heading it had.
+fn removal_kept(
+    new: &str,
+    before: &[(BlockKind, usize, Range<usize>)],
+    body: &str,
+    boundary: usize,
+    removed: &Range<usize>,
+) -> bool {
+    if frontmatter::body_start(new) != boundary {
+        return false;
+    }
+    // Compared offsets are content edges outside the cut; an offset
+    // inside it clamps to the cut start, where at worst it fails a
+    // match instead of wrapping.
+    let length = removed.end - removed.start;
+    let map = |offset: usize| {
+        if offset <= removed.start {
+            offset
+        } else {
+            offset.saturating_sub(length).max(removed.start)
+        }
+    };
+    let new_body = &new[boundary..];
+    let after = blocks(new_body);
+    let mut cursor = 0;
+    let mut matched = 0;
+    'blocks: for (kind, depth, span) in before {
+        let lead = content_start(body, span);
+        let tail = content_end(body, span);
+        if lead >= removed.start && tail <= removed.end {
+            continue;
+        }
+        let lead_known = lead < removed.start || lead >= removed.end;
+        let tail_known = tail <= removed.start || tail > removed.end;
+        let lead = if lead_known { map(lead) } else { removed.start };
+        let tail = map(tail);
+        let literal = matches!(kind, BlockKind::Code | BlockKind::Html);
+        let end = map(span.end);
+        while cursor < after.len() {
+            let (other, nested, candidate) = &after[cursor];
+            let found = content_start(new_body, candidate);
+            // A matching candidate never overshoots: a known lead is
+            // matched exactly, and no lead reaches its block's end.
+            if found > lead && (lead_known || found >= tail) {
+                break;
+            }
+            if kind_kept(*kind, *other, !lead_known)
+                && nested == depth
+                && (!lead_known || found == lead)
+                && (!tail_known || content_end(new_body, candidate) == tail)
+                && (!literal || candidate.end == end)
+            {
+                cursor += 1;
+                matched += 1;
+                continue 'blocks;
+            }
+            cursor += 1;
+        }
+        return false;
+    }
+    // A removal only ever deletes blocks: an unmatched leftover means
+    // the cut manufactured structure, like a blank line promoted to a
+    // list separator, reshaping bullets the query never named.
+    if matched != after.len() {
+        return false;
+    }
+    let expected: Vec<(HeadingLevel, usize)> = before
+        .iter()
+        .filter_map(|(kind, _, span)| {
+            let BlockKind::Heading(level) = kind else {
+                return None;
+            };
+            let lead = content_start(body, span);
+            if lead >= removed.start && content_end(body, span) <= removed.end {
+                return None;
+            }
+            Some((*level, map(span.start)))
+        })
+        .collect();
+    let found: Vec<(HeadingLevel, usize)> = after
+        .iter()
+        .filter_map(|(kind, _, span)| {
+            let BlockKind::Heading(level) = kind else {
+                return None;
+            };
+            Some((*level, span.start))
+        })
+        .collect();
+    let wanted = parented(&expected);
+    let real = parented(&found);
+    wanted
+        .iter()
+        .all(|(start, parent)| real.iter().any(|pair| pair == &(*start, *parent)))
 }
 
 /// A heading in the body: its level and the byte range of its source,
@@ -492,6 +802,18 @@ fn validated(query: &str, kind: Kind) -> Result<(), Error> {
         Kind::Heading => Error::InvalidHeading { query, reason },
         Kind::Bullet => Error::InvalidBullet { query, reason },
     })
+}
+
+/// The scope a placement narrows a placed edit to: the innermost
+/// matched section, then the interior of the last scoped bullet when
+/// the placement descends a thread.
+fn edit_scope(body: &str, outline: &Outline, scope: &Placement) -> Result<Range<usize>, Error> {
+    let section = heading_scope(body, outline, &scope.headings)?;
+    if scope.bullets.is_empty() {
+        return Ok(section);
+    }
+    let index = matched_bullet(body, outline, section, &scope.bullets)?;
+    Ok(interior(body, &outline.bullets[index]))
 }
 
 /// The scope a heading path narrows to: the whole body for an empty
@@ -611,6 +933,15 @@ fn interior(body: &str, bullet: &Bullet) -> Range<usize> {
 /// reaches back to the terminator before its indent.
 fn contains(scope: &Range<usize>, body: &str, span: &Range<usize>) -> bool {
     scope.start <= content_start(body, span) && span.end <= scope.end
+}
+
+/// The offset just past a span's last non-whitespace byte, where its
+/// content actually ends. Block spans absorb neighboring blank lines
+/// and the next line's indent as whitespace ownership shifts across an
+/// edit, so structural comparisons anchor on content, not span edges.
+fn content_end(body: &str, span: &Range<usize>) -> usize {
+    let trimmed = body[span.start..span.end].trim_end_matches([' ', '\t', '\r', '\n']);
+    span.start + trimmed.len()
 }
 
 /// The offset of a span's first non-whitespace byte, where its marker or
@@ -1887,5 +2218,508 @@ mod tests {
                 assert!(again.is_ok(), "for {new:?} with {indent:?}: {again:?}");
             }
         }
+    }
+
+    #[test]
+    fn removed_takes_the_matched_line() {
+        let text = "## A\n\n- one\n- two\n- three\n";
+        let new = removed(text, "two", &placed(&["A"], &[])).expect("removal succeeds");
+        assert_eq!(new, "## A\n\n- one\n- three\n");
+    }
+
+    /// Cutting the first line would promote the fence below it to byte
+    /// zero, turning the remainder into a frontmatter block and moving
+    /// the body boundary itself, so the removal is refused.
+    #[test]
+    fn removed_refuses_moving_the_body_boundary() {
+        let error = removed("- drop\n---\nk: v\n---\n", "drop", &placed(&[], &[]))
+            .expect_err("boundary move refuses");
+        assert_eq!(
+            error.to_string(),
+            "the removal would change the structure around it"
+        );
+    }
+
+    #[test]
+    fn removed_defaults_to_the_whole_body() {
+        let new = removed("- one\n- two\n", "one", &placed(&[], &[])).expect("removal succeeds");
+        assert_eq!(new, "- two\n");
+    }
+
+    #[test]
+    fn removed_descends_headings_and_bullets() {
+        let text = "# A\n- p\n\t- keep\n\t- drop\n# B\n- p\n\t- drop\n";
+        let new = removed(text, "drop", &placed(&["A"], &["p"])).expect("removal succeeds");
+        assert_eq!(new, "# A\n- p\n\t- keep\n# B\n- p\n\t- drop\n");
+    }
+
+    /// A following nested sibling's span reaches back into the removed
+    /// line's terminator; matching by content lead sees past that.
+    #[test]
+    fn removed_takes_a_leading_nested_sibling() {
+        let text = "- p\n\t- drop\n\t- keep\n";
+        let new = removed(text, "drop", &placed(&[], &["p"])).expect("removal succeeds");
+        assert_eq!(new, "- p\n\t- keep\n");
+    }
+
+    #[test]
+    fn removed_reads_every_marker() {
+        let cases = [
+            ("- x\n- y\n", "- x\n"),
+            ("* x\n* y\n", "* x\n"),
+            ("+ x\n+ y\n", "+ x\n"),
+            ("1. x\n2. y\n", "1. x\n"),
+            ("1) x\n2) y\n", "1) x\n"),
+        ];
+        for (text, expected) in cases {
+            let new = removed(text, "y", &placed(&[], &[])).expect("removal succeeds");
+            assert_eq!(new, expected, "for {text:?}");
+        }
+    }
+
+    #[test]
+    fn removed_refuses_nested_content() {
+        let cases = [
+            "- drop\n\t- child\n",
+            "- drop\n  more text\n",
+            "- drop\n\n  ```\n  code\n  ```\n",
+            "- drop\n  > quoted\n",
+        ];
+        for text in cases {
+            let error =
+                removed(text, "drop", &placed(&[], &[])).expect_err("nested content refuses");
+            assert_eq!(
+                error.to_string(),
+                "the bullet matching \"drop\" holds nested content",
+                "for {text:?}"
+            );
+        }
+    }
+
+    /// The cut takes exactly the named line: blank lines around it,
+    /// the loose list's separators, all stay.
+    #[test]
+    fn removed_takes_only_the_line_in_a_loose_list() {
+        let text = "- a\n\n- b\n\n- c\n";
+        let new = removed(text, "b", &placed(&[], &[])).expect("removal succeeds");
+        assert_eq!(new, "- a\n\n\n- c\n");
+    }
+
+    #[test]
+    fn removed_takes_the_only_item() {
+        let text = "## A\n\n- solo\n\ntext\n";
+        let new = removed(text, "solo", &placed(&["A"], &[])).expect("removal succeeds");
+        assert_eq!(new, "## A\n\n\ntext\n");
+    }
+
+    /// A last item's span holds the blank after its list; the survivor
+    /// absorbs that residue and the blank separator stays in the note.
+    #[test]
+    fn removed_takes_the_last_item_before_a_block() {
+        let cases = [
+            ("- a\n- zdrop\n\nparagraph\n", "- a\n\nparagraph\n"),
+            (
+                "## S\n\n- x\n- zdrop\n\n## Next\n",
+                "## S\n\n- x\n\n## Next\n",
+            ),
+            ("- a\n- zdrop\n\n* other\n", "- a\n\n* other\n"),
+            ("- a\n\t- zdrop\n\n> quote\n", "- a\n\n> quote\n"),
+            (
+                "- a\n- zdrop\n\n```\ncode\n```\n",
+                "- a\n\n```\ncode\n```\n",
+            ),
+        ];
+        for (text, expected) in cases {
+            let new = removed(text, "zdrop", &placed(&[], &[])).expect("removal succeeds");
+            assert_eq!(new, expected, "for {text:?}");
+        }
+    }
+
+    /// The daily-note shape: retracting the last sub-bullet of a
+    /// session thread keeps the blank separating session groups.
+    #[test]
+    fn removed_takes_the_last_nested_child() {
+        let text = "## Stream\n\n- Session A\n\t- did x\n\t- did y\n\n- Session B\n\t- did z\n";
+        let new =
+            removed(text, "did y", &placed(&["Stream"], &["Session A"])).expect("removal succeeds");
+        assert_eq!(
+            new,
+            "## Stream\n\n- Session A\n\t- did x\n\n- Session B\n\t- did z\n"
+        );
+    }
+
+    /// A cut that would promote a nested blank line into a top-level
+    /// separator reshapes untouched siblings, so it is refused.
+    #[test]
+    fn removed_refuses_promoting_a_nested_blank() {
+        let text = "- a\n\t- b\n\n\t- b2\n\n\t- zd\n- last\n";
+        let error = removed(text, "zd", &placed(&[], &[])).expect_err("loose flip refuses");
+        assert_eq!(
+            error.to_string(),
+            "the removal would change the structure around it"
+        );
+    }
+
+    /// A bullet whose own text spells a heading parses as a heading
+    /// block inside the item; it vanishes with the cut like anything
+    /// else on the removed line.
+    #[test]
+    fn removed_takes_a_bullet_spelling_a_heading() {
+        let cases = [
+            ("- # of retries hit 3\n- next\n", "# of retries", "- next\n"),
+            ("- first\n- # ZZ\n", "# ZZ", "- first\n"),
+            ("- x\n\t- ## deep\n", "## deep", "- x\n"),
+        ];
+        for (text, query, expected) in cases {
+            let new = removed(text, query, &placed(&[], &[])).expect("removal succeeds");
+            assert_eq!(new, expected, "for {text:?}");
+        }
+    }
+
+    /// A container's span reaches into the next line's indentation, so
+    /// blocks compare by content edges, not span edges.
+    #[test]
+    fn removed_reads_indent_wobble() {
+        let text = "- a\n  - b\n  1. x\n";
+        let new = removed(text, "b", &placed(&[], &[])).expect("removal succeeds");
+        assert_eq!(new, "- a\n  1. x\n");
+        let new = removed(text, "x", &placed(&[], &[])).expect("removal succeeds");
+        assert_eq!(new, "- a\n  - b\n");
+    }
+
+    /// The vanished nested list's span runs into the continuation
+    /// line's indent; content edges see past it.
+    #[test]
+    fn removed_takes_the_only_child_before_a_continuation() {
+        let text = "## S\n\n- Session A\n\t- did x\n\n  wrap up line\n";
+        let new = removed(text, "did x", &placed(&["S"], &[])).expect("removal succeeds");
+        assert_eq!(new, "## S\n\n- Session A\n\n  wrap up line\n");
+    }
+
+    /// A surviving sibling list's span absorbs its own terminator when
+    /// a differently-marked sibling vanishes; its content edge stays.
+    #[test]
+    fn removed_takes_a_mixed_marker_sibling() {
+        let text = "- Session A\n\t1. reviewed the PR\n\t- shipped it\n";
+        let new =
+            removed(text, "shipped it", &placed(&[], &["Session A"])).expect("removal succeeds");
+        assert_eq!(new, "- Session A\n\t1. reviewed the PR\n");
+    }
+
+    /// The blank a removed last item leaves behind would become
+    /// content inside an unclosed fence or raw HTML block, so the
+    /// removal is refused rather than silently editing code.
+    #[test]
+    fn removed_refuses_feeding_a_code_block() {
+        let cases = [
+            "- notes\n\t```\n\tlet a = 1;\n- scratch\n\n\n",
+            "- notes\n\t<pre>x\n- scratch\n\n\n",
+        ];
+        for text in cases {
+            let error = removed(text, "scratch", &placed(&[], &[])).expect_err("code feed refuses");
+            assert_eq!(
+                error.to_string(),
+                "the removal would change the structure around it",
+                "for {text:?}"
+            );
+        }
+    }
+
+    /// Cutting the first item of an ordered list promotes the next
+    /// item's marker to the list's start: a sequential list renders
+    /// unchanged and passes, a gapped one renumbers and is refused.
+    /// Cutting a later item renumbers the rest downward, the way
+    /// deleting from a numbered list does everywhere, and passes.
+    #[test]
+    fn removed_guards_ordered_list_starts() {
+        let new = removed("1. one\n2. two\n3. three\n", "one", &placed(&[], &[]))
+            .expect("sequential start succeeds");
+        assert_eq!(new, "2. two\n3. three\n");
+        let new = removed("1. keep\n2. drop\n3. later\n", "drop", &placed(&[], &[]))
+            .expect("natural renumbering succeeds");
+        assert_eq!(new, "1. keep\n3. later\n");
+        let new = removed("1. drop\n1. keep\n", "drop", &placed(&[], &[]))
+            .expect("an all-ones list renumbers downward");
+        assert_eq!(new, "1. keep\n");
+        let error = removed("1. zdrop\n5. five\n7. seven\n", "zdrop", &placed(&[], &[]))
+            .expect_err("renumbering refuses");
+        assert_eq!(
+            error.to_string(),
+            "the removal would change the structure around it"
+        );
+    }
+
+    /// A bullet's own single line goes whole, whatever blocks its text
+    /// parses into: a quoted child is not separately addressable, so
+    /// it vanishes with its bullet the way a spelled heading does.
+    #[test]
+    fn removed_takes_a_bullet_quoting_content() {
+        let new = removed("- > - child\n- keep\n", "> - child", &placed(&[], &[]))
+            .expect("removal succeeds");
+        assert_eq!(new, "- keep\n");
+    }
+
+    /// A marker-line sublist nests a child on the parent's own line:
+    /// removing the parent is refused for the child it holds, and
+    /// removing the child is refused for the line it shares.
+    #[test]
+    fn removed_refuses_marker_line_nesting() {
+        let text = "- - child\n- keep\n";
+        let error = removed(text, "- child", &placed(&[], &[])).expect_err("nested child refuses");
+        assert_eq!(
+            error.to_string(),
+            "the bullet matching \"- child\" holds nested content"
+        );
+        let error = removed(text, "child", &placed(&[], &[])).expect_err("shared line refuses");
+        assert_eq!(
+            error.to_string(),
+            "the bullet matching \"child\" shares its line with another bullet"
+        );
+    }
+
+    /// Removing the last item of a loose list would leave a tight one,
+    /// reshaping the survivor's blocks, so the removal is refused.
+    #[test]
+    fn removed_refuses_a_reshaping_removal() {
+        let cases = ["- a\n\n- b\n", "- a\n\n- b\n\ntail\n"];
+        for text in cases {
+            let error = removed(text, "b", &placed(&[], &[])).expect_err("loose survivor refuses");
+            assert_eq!(
+                error.to_string(),
+                "the removal would change the structure around it",
+                "for {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn removed_reports_unmatched_and_ambiguous_targets() {
+        let cases = [
+            ("- x\n", "y", "no bullet matching \"y\""),
+            ("- x\n- xy\n", "x", "multiple bullets matching \"x\""),
+        ];
+        for (text, query, message) in cases {
+            let error = removed(text, query, &placed(&[], &[])).expect_err("bad target fails");
+            assert_eq!(error.to_string(), message, "for {text:?}");
+        }
+        let error = removed("- x\n", "x", &placed(&["A"], &[])).expect_err("missing scope fails");
+        assert_eq!(error.to_string(), "no heading matching \"A\"");
+    }
+
+    #[test]
+    fn removed_validates_queries() {
+        let cases: [(&[&str], &[&str], &str, &str); 3] = [
+            (&["A"], &[], "", "invalid bullet \"\": it is empty"),
+            (&[""], &[], "x", "invalid heading \"\": it is empty"),
+            (
+                &[],
+                &["a\nb"],
+                "x",
+                "invalid bullet \"a\\nb\": it contains a line break",
+            ),
+        ];
+        for (headings, bullets, query, message) in cases {
+            let error =
+                removed("- x\n", query, &placed(headings, bullets)).expect_err("invalid fails");
+            assert_eq!(error.to_string(), message, "for {query:?}");
+        }
+    }
+
+    #[test]
+    fn removed_refuses_bare_carriage_returns() {
+        let error = removed("- a\r- b\r", "b", &placed(&[], &[])).expect_err("bare CR refuses");
+        assert_eq!(
+            error.to_string(),
+            "the note uses bare carriage-return line endings"
+        );
+    }
+
+    #[test]
+    fn removed_skips_frontmatter() {
+        let text = "---\nk: v\n---\n- a\n- b\n";
+        let new = removed(text, "b", &placed(&[], &[])).expect("removal succeeds");
+        assert_eq!(new, "---\nk: v\n---\n- a\n");
+    }
+
+    #[test]
+    fn removed_keeps_a_crlf_note_crlf() {
+        let text = "## A\r\n\r\n- one\r\n- two\r\n";
+        let new = removed(text, "two", &placed(&["A"], &[])).expect("removal succeeds");
+        assert_eq!(new, "## A\r\n\r\n- one\r\n");
+    }
+
+    #[test]
+    fn removed_takes_an_unterminated_last_line() {
+        let new = removed("- a\n- b", "b", &placed(&[], &[])).expect("removal succeeds");
+        assert_eq!(new, "- a\n");
+    }
+
+    /// A probe an insertion placed must remove back to the original
+    /// note: the removal-side analogue of addressability.
+    #[test]
+    fn removed_round_trips_an_appended_probe() {
+        let cases: [(&str, &[&str], &[&str]); 5] = [
+            ("# A\nalpha\n", &["A"], &[]),
+            ("- p\n\t- c\n", &[], &["p", "c"]),
+            ("## A\n\n- p\nx\n", &["A"], &["p"]),
+            ("#### Thoughts\n\n#### Stream\n", &["Thoughts"], &[]),
+            (
+                "## S\n\n- Session A\n\t- did x\n\n- Session B\n",
+                &["S"],
+                &["Session A"],
+            ),
+        ];
+        for (text, headings, bullets) in cases {
+            let grown =
+                inserted(text, "- zq probe", &placed(headings, bullets)).expect("insert succeeds");
+            let back =
+                removed(&grown, "zq probe", &placed(headings, bullets)).expect("removal succeeds");
+            assert_eq!(back, text, "for {text:?}");
+        }
+    }
+
+    #[test]
+    fn toggled_flips_the_matched_task() {
+        let text = "- [ ] milk\n- [x] bob\n";
+        let new = toggled(text, "milk", &placed(&[], &[]), true).expect("check succeeds");
+        assert_eq!(new, "- [x] milk\n- [x] bob\n");
+        let new = toggled(&new, "bob", &placed(&[], &[]), false).expect("uncheck succeeds");
+        assert_eq!(new, "- [x] milk\n- [ ] bob\n");
+    }
+
+    /// The query names the task's text past the box, so the same query
+    /// checks a task and unchecks it again.
+    #[test]
+    fn toggled_matches_past_the_box() {
+        let text = "- [ ] milk\n";
+        let checked = toggled(text, "milk", &placed(&[], &[]), true).expect("check succeeds");
+        let back = toggled(&checked, "milk", &placed(&[], &[]), false).expect("uncheck succeeds");
+        assert_eq!(back, text);
+    }
+
+    #[test]
+    fn toggled_leaves_the_asked_state() {
+        let cases = [
+            ("- [x] t\n", true),
+            ("- [X] t\n", true),
+            ("- [ ] t\n", false),
+        ];
+        for (text, checked) in cases {
+            let new = toggled(text, "t", &placed(&[], &[]), checked).expect("no-op succeeds");
+            assert_eq!(new, text, "for {text:?}");
+        }
+    }
+
+    #[test]
+    fn toggled_reads_task_shapes() {
+        let cases = [
+            ("- [X] t\n", "- [ ] t\n"),
+            ("* [x] t\n", "* [ ] t\n"),
+            ("+ [x] t\n", "+ [ ] t\n"),
+            ("1. [x] t\n", "1. [ ] t\n"),
+        ];
+        for (text, expected) in cases {
+            let new = toggled(text, "t", &placed(&[], &[]), false).expect("uncheck succeeds");
+            assert_eq!(new, expected, "for {text:?}");
+        }
+    }
+
+    /// Only task bullets are candidates: a plain bullet or a bracketed
+    /// line that is no box never matches, whatever its text.
+    #[test]
+    fn toggled_skips_non_tasks() {
+        let cases = ["- t\n", "- [y] t\n", "- [ ]t\n", "- [x]t\n", "-\n"];
+        for text in cases {
+            let error =
+                toggled(text, "t", &placed(&[], &[]), true).expect_err("non-task never matches");
+            assert_eq!(error.to_string(), "no task matching \"t\"", "for {text:?}");
+        }
+        let new =
+            toggled("- t\n- [ ] t\n", "t", &placed(&[], &[]), true).expect("the one task matches");
+        assert_eq!(new, "- t\n- [x] t\n");
+    }
+
+    #[test]
+    fn toggled_accepts_a_bare_box() {
+        let new = toggled("- [ ]\n", "x", &placed(&[], &[]), true).expect_err("nothing matches");
+        assert_eq!(new.to_string(), "no task matching \"x\"");
+    }
+
+    /// Whitespace after the box is separator, not text: a tab or extra
+    /// spaces never have to be spelled in the query.
+    #[test]
+    fn toggled_reads_separator_whitespace() {
+        let cases = [
+            ("- [ ]\tship it\n", "- [x]\tship it\n"),
+            ("- [ ]  ship it\n", "- [x]  ship it\n"),
+            ("- [ ] \t ship it\n", "- [x] \t ship it\n"),
+        ];
+        for (text, expected) in cases {
+            let new = toggled(text, "ship it", &placed(&[], &[]), true).expect("check succeeds");
+            assert_eq!(new, expected, "for {text:?}");
+        }
+    }
+
+    /// A wide gap after the marker turns the rest of the line into
+    /// indented code inside the item; a box the parser reads as code
+    /// is content, never a task.
+    #[test]
+    fn toggled_skips_a_boxed_code_sample() {
+        let cases = ["-     [ ] code sample\n", "-\t\t[ ] code sample\n"];
+        for text in cases {
+            let error = toggled(text, "code sample", &placed(&[], &[]), true)
+                .expect_err("code is never a task");
+            assert_eq!(
+                error.to_string(),
+                "no task matching \"code sample\"",
+                "for {text:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn toggled_scopes_and_descends() {
+        let text = "# A\n- p\n\t- [ ] t\n# B\n- p\n\t- [ ] t\n";
+        let new = toggled(text, "t", &placed(&["A"], &["p"]), true).expect("check succeeds");
+        assert_eq!(new, "# A\n- p\n\t- [x] t\n# B\n- p\n\t- [ ] t\n");
+    }
+
+    #[test]
+    fn toggled_reports_no_and_multiple_tasks() {
+        let error = toggled("- [ ] t\n- [x] tu\n", "t", &placed(&[], &[]), true)
+            .expect_err("two tasks are ambiguous");
+        assert_eq!(error.to_string(), "multiple tasks matching \"t\"");
+        let error =
+            toggled("- [ ] t\n", "t", &placed(&["A"], &[]), true).expect_err("missing scope");
+        assert_eq!(error.to_string(), "no heading matching \"A\"");
+    }
+
+    #[test]
+    fn toggled_validates_queries() {
+        let error = toggled("- [ ] t\n", "", &placed(&[], &[]), true).expect_err("empty query");
+        assert_eq!(error.to_string(), "invalid bullet \"\": it is empty");
+        let error = toggled("- [ ] t\n", "t", &placed(&["a\nb"], &["c"]), true)
+            .expect_err("broken heading query");
+        assert_eq!(
+            error.to_string(),
+            "invalid heading \"a\\nb\": it contains a line break"
+        );
+    }
+
+    #[test]
+    fn toggled_refuses_bare_carriage_returns() {
+        let error =
+            toggled("- [ ] t\r", "t", &placed(&[], &[]), true).expect_err("bare CR refuses");
+        assert_eq!(
+            error.to_string(),
+            "the note uses bare carriage-return line endings"
+        );
+    }
+
+    #[test]
+    fn toggled_skips_frontmatter_and_keeps_crlf() {
+        let text = "---\nk: v\n---\n- [ ] t\r\n";
+        let new = toggled(text, "t", &placed(&[], &[]), true).expect("check succeeds");
+        assert_eq!(new, "---\nk: v\n---\n- [x] t\r\n");
     }
 }

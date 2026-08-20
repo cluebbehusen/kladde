@@ -350,6 +350,61 @@ impl Guard<'_> {
         }
         self.replace(&new)
     }
+
+    /// Removes the one bullet `query` names inside the scope `along`
+    /// names, as [`structure::removed`] describes, stamping the note in
+    /// the same atomic write when `stamp` is given. Nothing is created:
+    /// a missing note reads as empty, where no bullet can match, so the
+    /// removal errors before writing anything.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the target [`structure::removed`] rejects,
+    /// or when reading or writing fails as [`Self::current`] and
+    /// [`Self::replace`] report.
+    pub fn remove(
+        &self,
+        query: &str,
+        along: &structure::Placement,
+        stamp: Option<&frontmatter::Stamp<'_>>,
+    ) -> Result<(), Error> {
+        let (current, _) = self.current(None)?;
+        let mut new = structure::removed(&current, query, along)?;
+        if let Some(stamp) = stamp {
+            new = frontmatter::stamped(&new, frontmatter::has_block(&current), stamp);
+        }
+        self.replace(&new)
+    }
+
+    /// Checks or unchecks the one task `query` names inside the scope
+    /// `along` names, as [`structure::toggled`] describes, stamping the
+    /// note in the same atomic write when the flip changes it. A task
+    /// already in the asked state is success without a write, so the
+    /// updated stamp never moves for a no-op. Nothing is created: a
+    /// missing note reads as empty, where no task can match.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the target [`structure::toggled`] rejects,
+    /// or when reading or writing fails as [`Self::current`] and
+    /// [`Self::replace`] report.
+    pub fn toggle(
+        &self,
+        query: &str,
+        along: &structure::Placement,
+        checked: bool,
+        stamp: Option<&frontmatter::Stamp<'_>>,
+    ) -> Result<(), Error> {
+        let (current, _) = self.current(None)?;
+        let mut new = structure::toggled(&current, query, along, checked)?;
+        if new == current {
+            return Ok(());
+        }
+        if let Some(stamp) = stamp {
+            new = frontmatter::stamped(&new, frontmatter::has_block(&current), stamp);
+        }
+        self.replace(&new)
+    }
 }
 
 /// Fills the temporary file: permissions first, so a private note's
@@ -1027,5 +1082,118 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[test]
+    fn remove_takes_the_matched_bullet() {
+        let root = temp();
+        let locks = temp();
+        fs::write(root.path().join("x.md"), "- a\n- b\n").expect("fixture writes");
+        let target = note(&root, "x.md");
+        Lock::acquire(locks.path(), target.root())
+            .expect("lock acquires")
+            .guard(&target)
+            .remove("b", &eof(), None)
+            .expect("removal succeeds");
+        let contents = fs::read_to_string(target.as_path()).expect("note reads");
+        assert_eq!(contents, "- a\n");
+    }
+
+    /// A missing note reads as empty, where no bullet can match, so a
+    /// removal errors before creating anything.
+    #[test]
+    fn remove_on_a_missing_note_creates_nothing() {
+        let root = temp();
+        let locks = temp();
+        let target = note(&root, "x.md");
+        let error = Lock::acquire(locks.path(), target.root())
+            .expect("lock acquires")
+            .guard(&target)
+            .remove("b", &eof(), None)
+            .expect_err("missing note fails");
+        assert_eq!(error.to_string(), "no bullet matching \"b\"");
+        assert!(!target.as_path().exists());
+    }
+
+    #[test]
+    fn remove_stamps_the_edit() {
+        let root = temp();
+        let locks = temp();
+        let text = "---\ncreated: old\nupdated: old\n---\n- a\n- b\n";
+        fs::write(root.path().join("x.md"), text).expect("fixture writes");
+        let target = note(&root, "x.md");
+        let stamp = frontmatter::Stamp::new("created", "updated", "T").expect("stamp validates");
+        Lock::acquire(locks.path(), target.root())
+            .expect("lock acquires")
+            .guard(&target)
+            .remove("b", &eof(), Some(&stamp))
+            .expect("removal succeeds");
+        let contents = fs::read_to_string(target.as_path()).expect("note reads");
+        assert_eq!(contents, "---\ncreated: old\nupdated: T\n---\n- a\n");
+    }
+
+    #[test]
+    fn toggle_stamps_a_real_flip() {
+        let root = temp();
+        let locks = temp();
+        let text = "---\ncreated: old\nupdated: old\n---\n- [ ] t\n";
+        fs::write(root.path().join("x.md"), text).expect("fixture writes");
+        let target = note(&root, "x.md");
+        let stamp = frontmatter::Stamp::new("created", "updated", "T").expect("stamp validates");
+        Lock::acquire(locks.path(), target.root())
+            .expect("lock acquires")
+            .guard(&target)
+            .toggle("t", &eof(), true, Some(&stamp))
+            .expect("check succeeds");
+        let contents = fs::read_to_string(target.as_path()).expect("note reads");
+        assert_eq!(contents, "---\ncreated: old\nupdated: T\n---\n- [x] t\n");
+    }
+
+    /// A task already in the asked state is success without a write:
+    /// the updated stamp never moves for a no-op.
+    #[test]
+    fn toggle_of_the_asked_state_writes_nothing() {
+        let root = temp();
+        let locks = temp();
+        let text = "---\ncreated: old\nupdated: old\n---\n- [x] t\n";
+        fs::write(root.path().join("x.md"), text).expect("fixture writes");
+        let target = note(&root, "x.md");
+        let stamp = frontmatter::Stamp::new("created", "updated", "T").expect("stamp validates");
+        Lock::acquire(locks.path(), target.root())
+            .expect("lock acquires")
+            .guard(&target)
+            .toggle("t", &eof(), true, Some(&stamp))
+            .expect("no-op succeeds");
+        let contents = fs::read_to_string(target.as_path()).expect("note reads");
+        assert_eq!(contents, text);
+    }
+
+    #[test]
+    fn toggle_on_a_missing_note_creates_nothing() {
+        let root = temp();
+        let locks = temp();
+        let target = note(&root, "x.md");
+        let error = Lock::acquire(locks.path(), target.root())
+            .expect("lock acquires")
+            .guard(&target)
+            .toggle("t", &eof(), true, None)
+            .expect_err("missing note fails");
+        assert_eq!(error.to_string(), "no task matching \"t\"");
+        assert!(!target.as_path().exists());
+    }
+
+    #[test]
+    fn toggle_unchecks_without_a_stamp() {
+        let root = temp();
+        let locks = temp();
+        fs::write(root.path().join("x.md"), "- [x] t\n").expect("fixture writes");
+        let target = note(&root, "x.md");
+        Lock::acquire(locks.path(), target.root())
+            .expect("lock acquires")
+            .guard(&target)
+            .toggle("t", &eof(), false, None)
+            .expect("uncheck succeeds");
+        let contents = fs::read_to_string(target.as_path()).expect("note reads");
+        assert_eq!(contents, "- [ ] t\n");
     }
 }

@@ -126,6 +126,102 @@ enum Command {
         #[command(flatten)]
         notebook: NotebookArg,
     },
+    /// Remove a bullet from a note.
+    ///
+    /// The bullet is matched by `--match`, a prefix of its first line
+    /// past its marker, inside the scope `--under` and `--under-bullet`
+    /// name the way an appended entry's place is. Exactly one bullet
+    /// must match, and a bullet holding anything beyond its first line,
+    /// child bullets or nested blocks, is refused rather than taken
+    /// with it. Nothing is created: a missing note has no bullet to
+    /// match. With no target, the note is today's daily note. Writes
+    /// take the notebook's lock and replace the note atomically.
+    Remove {
+        /// Bullet to remove, a prefix of its first line past its
+        /// marker. Exactly one bullet must match.
+        #[arg(long = "match", value_name = "BULLET", allow_hyphen_values = true)]
+        matched: String,
+        /// Heading whose section holds the bullet, a prefix of the
+        /// heading as written, its `#` marks excluded. Exactly one
+        /// heading must match. Repeat to descend: each later heading is
+        /// found inside the previous one's section.
+        #[arg(long, value_name = "HEADING", allow_hyphen_values = true)]
+        under: Vec<String>,
+        /// Bullet whose thread holds the removed bullet, a prefix of
+        /// its first line past its marker. Exactly one bullet must
+        /// match. Repeat to descend a thread; with `--under`, the first
+        /// bullet is found inside that section.
+        #[arg(long, value_name = "BULLET", allow_hyphen_values = true)]
+        under_bullet: Vec<String>,
+        #[command(flatten)]
+        target: TargetArgs,
+        #[command(flatten)]
+        notebook: NotebookArg,
+    },
+    /// Check a task in a note.
+    ///
+    /// A task is a bullet whose text starts with `[ ]` or `[x]`. The
+    /// task is matched by `--match`, a prefix of its text past the box,
+    /// so the same match works before and after checking, inside the
+    /// scope `--under` and `--under-bullet` name. Exactly one task must
+    /// match. A task that is already checked is left alone, which is
+    /// success. Nothing is created: a missing note has no task to
+    /// match. With no target, the note is today's daily note. Writes
+    /// take the notebook's lock and replace the note atomically.
+    Check {
+        /// Task to check, a prefix of its text past the box. Exactly
+        /// one task must match.
+        #[arg(long = "match", value_name = "TASK", allow_hyphen_values = true)]
+        matched: String,
+        /// Heading whose section holds the task, a prefix of the
+        /// heading as written, its `#` marks excluded. Exactly one
+        /// heading must match. Repeat to descend: each later heading is
+        /// found inside the previous one's section.
+        #[arg(long, value_name = "HEADING", allow_hyphen_values = true)]
+        under: Vec<String>,
+        /// Bullet whose thread holds the task, a prefix of its first
+        /// line past its marker. Exactly one bullet must match. Repeat
+        /// to descend a thread; with `--under`, the first bullet is
+        /// found inside that section.
+        #[arg(long, value_name = "BULLET", allow_hyphen_values = true)]
+        under_bullet: Vec<String>,
+        #[command(flatten)]
+        target: TargetArgs,
+        #[command(flatten)]
+        notebook: NotebookArg,
+    },
+    /// Uncheck a task in a note.
+    ///
+    /// A task is a bullet whose text starts with `[ ]` or `[x]`. The
+    /// task is matched by `--match`, a prefix of its text past the box,
+    /// so the same match works before and after checking, inside the
+    /// scope `--under` and `--under-bullet` name. Exactly one task must
+    /// match. A task that is already unchecked is left alone, which is
+    /// success. Nothing is created: a missing note has no task to
+    /// match. With no target, the note is today's daily note. Writes
+    /// take the notebook's lock and replace the note atomically.
+    Uncheck {
+        /// Task to uncheck, a prefix of its text past the box. Exactly
+        /// one task must match.
+        #[arg(long = "match", value_name = "TASK", allow_hyphen_values = true)]
+        matched: String,
+        /// Heading whose section holds the task, a prefix of the
+        /// heading as written, its `#` marks excluded. Exactly one
+        /// heading must match. Repeat to descend: each later heading is
+        /// found inside the previous one's section.
+        #[arg(long, value_name = "HEADING", allow_hyphen_values = true)]
+        under: Vec<String>,
+        /// Bullet whose thread holds the task, a prefix of its first
+        /// line past its marker. Exactly one bullet must match. Repeat
+        /// to descend a thread; with `--under`, the first bullet is
+        /// found inside that section.
+        #[arg(long, value_name = "BULLET", allow_hyphen_values = true)]
+        under_bullet: Vec<String>,
+        #[command(flatten)]
+        target: TargetArgs,
+        #[command(flatten)]
+        notebook: NotebookArg,
+    },
     /// Work with a note's properties.
     ///
     /// Properties are the note's YAML frontmatter: `key: value` lines
@@ -364,12 +460,16 @@ const NO_CONFIG_DIR: &str =
 fn main() -> ExitCode {
     match Cli::parse().command {
         Command::Config(command) => config(command),
-        Command::Path { target, notebook } => {
-            dispatch(target, notebook.notebook, None, |note, _guard, _seed| {
+        Command::Path { target, notebook } => dispatch(
+            target,
+            notebook.notebook,
+            None,
+            false,
+            |note, _guard, _seed| {
                 print_path(note.as_path());
                 ExitCode::SUCCESS
-            })
-        }
+            },
+        ),
         Command::Read { target, notebook } => read(target, notebook.notebook),
         Command::List { notebook } => list(notebook.notebook),
         Command::Search { query, notebook } => search(&query, notebook.notebook),
@@ -382,6 +482,41 @@ fn main() -> ExitCode {
             target,
             notebook,
         } => append(&text, under, under_bullet, target, notebook.notebook),
+        Command::Remove {
+            matched,
+            under,
+            under_bullet,
+            target,
+            notebook,
+        } => remove_bullet(&matched, under, under_bullet, target, notebook.notebook),
+        Command::Check {
+            matched,
+            under,
+            under_bullet,
+            target,
+            notebook,
+        } => toggle_task(
+            &matched,
+            under,
+            under_bullet,
+            target,
+            notebook.notebook,
+            true,
+        ),
+        Command::Uncheck {
+            matched,
+            under,
+            under_bullet,
+            target,
+            notebook,
+        } => toggle_task(
+            &matched,
+            under,
+            under_bullet,
+            target,
+            notebook.notebook,
+            false,
+        ),
         Command::Frontmatter(command) => frontmatter(command),
     }
 }
@@ -402,13 +537,15 @@ type Seed = Option<Result<String, String>>;
 /// `locks`, the notebook's lock is taken before the note is resolved and
 /// `act` receives a guard: resolution racing another writer's atomic
 /// replace can transiently misread the filesystem, so writers resolve
-/// inside the critical section. Only daily resolution carries a seed;
-/// an explicit target never seeds, even one spelling a daily note's
-/// path.
+/// inside the critical section. Only daily resolution carries a seed,
+/// and only for a `seeded` command: an edit that never creates a note
+/// must not read and render the template under the lock, and an
+/// explicit target never seeds, even one spelling a daily note's path.
 fn dispatch(
     target: TargetArgs,
     flag: Option<PathBuf>,
     locks: Option<&Path>,
+    seeded: bool,
     act: impl FnOnce(&Note, Option<&kladde::write::Guard>, Seed) -> ExitCode,
 ) -> ExitCode {
     if let Some(relative) = target.target {
@@ -427,7 +564,7 @@ fn dispatch(
             act,
         );
     }
-    daily_note(target.date, flag, locks, act)
+    daily_note(target.date, flag, locks, seeded, act)
 }
 
 /// The directory for lock files, from the environment.
@@ -460,7 +597,7 @@ fn append(
         indent: config.bullet_indent.unwrap_or_default(),
     };
     let stamping = stamping(config);
-    dispatch(target, root, Some(&locks), |note, guard, seed| {
+    dispatch(target, root, Some(&locks), true, |note, guard, seed| {
         let guard = guard.expect("write dispatch locks the notebook");
         let seed = match seeding(&seed) {
             Ok(seed) => seed,
@@ -482,11 +619,93 @@ fn append(
     })
 }
 
+fn remove_bullet(
+    matched: &str,
+    under: Vec<String>,
+    under_bullet: Vec<String>,
+    target: TargetArgs,
+    flag: Option<PathBuf>,
+) -> ExitCode {
+    let locks = match locks() {
+        Ok(locks) => locks,
+        Err(message) => return fail(message),
+    };
+    let (config, root) = match layered_config(flag) {
+        Ok(loaded) => loaded,
+        Err(message) => return fail(message),
+    };
+    let scope = kladde::structure::Placement {
+        headings: under,
+        bullets: under_bullet,
+        indent: kladde::structure::Indent::default(),
+    };
+    let stamping = stamping(config);
+    dispatch(target, root, Some(&locks), false, |note, guard, _seed| {
+        // The seed stays unused: a removal edits what exists, so a
+        // missing daily note must not materialize its template first.
+        let guard = guard.expect("write dispatch locks the notebook");
+        let timestamp = stamping.timestamp(note);
+        match guard.remove(
+            matched,
+            &scope,
+            stamping.stamp(timestamp.as_deref()).as_ref(),
+        ) {
+            Ok(()) => {
+                print_path(note.as_path());
+                ExitCode::SUCCESS
+            }
+            Err(error) => fail(error),
+        }
+    })
+}
+
+fn toggle_task(
+    matched: &str,
+    under: Vec<String>,
+    under_bullet: Vec<String>,
+    target: TargetArgs,
+    flag: Option<PathBuf>,
+    checked: bool,
+) -> ExitCode {
+    let locks = match locks() {
+        Ok(locks) => locks,
+        Err(message) => return fail(message),
+    };
+    let (config, root) = match layered_config(flag) {
+        Ok(loaded) => loaded,
+        Err(message) => return fail(message),
+    };
+    let scope = kladde::structure::Placement {
+        headings: under,
+        bullets: under_bullet,
+        indent: kladde::structure::Indent::default(),
+    };
+    let stamping = stamping(config);
+    dispatch(target, root, Some(&locks), false, |note, guard, _seed| {
+        // The seed stays unused: a flip edits what exists, so a
+        // missing daily note must not materialize its template first.
+        let guard = guard.expect("write dispatch locks the notebook");
+        let timestamp = stamping.timestamp(note);
+        match guard.toggle(
+            matched,
+            &scope,
+            checked,
+            stamping.stamp(timestamp.as_deref()).as_ref(),
+        ) {
+            Ok(()) => {
+                print_path(note.as_path());
+                ExitCode::SUCCESS
+            }
+            Err(error) => fail(error),
+        }
+    })
+}
+
 /// Prints a note's contents without taking the notebook's lock: the
 /// atomic replace means a reader never sees a half-written note, and a
 /// read must not create or wait for anything.
 fn read(target: TargetArgs, flag: Option<PathBuf>) -> ExitCode {
-    dispatch(target, flag, None, |note, _guard, _seed| {
+    dispatch(target, flag, None, false, |note, _guard, _seed| {
         let path = note.as_path();
         match std::fs::read_to_string(path) {
             Ok(contents) => {
@@ -602,6 +821,7 @@ fn open_note(target: TargetArgs, flag: Option<PathBuf>) -> ExitCode {
         target,
         root,
         None,
+        false,
         |note, _guard, _seed| match kladde::editor::open(note.as_path(), command.as_deref()) {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => fail(error),
@@ -621,7 +841,7 @@ fn new_note(target: TargetArgs, flag: Option<PathBuf>) -> ExitCode {
         Err(message) => return fail(message),
     };
     let stamping = stamping(config);
-    dispatch(target, root, Some(&locks), |note, guard, seed| {
+    dispatch(target, root, Some(&locks), true, |note, guard, seed| {
         let guard = guard.expect("write dispatch locks the notebook");
         let seed = match seeding(&seed) {
             Ok(seed) => seed,
@@ -777,7 +997,7 @@ fn frontmatter(command: FrontmatterCommand) -> ExitCode {
 /// atomic replace means a reader never sees a half-written note, and a
 /// read must not create or wait for anything.
 fn frontmatter_get(key: &str, target: TargetArgs, flag: Option<PathBuf>) -> ExitCode {
-    dispatch(target, flag, None, |note, _guard, _seed| {
+    dispatch(target, flag, None, false, |note, _guard, _seed| {
         let path = note.as_path();
         let contents = match std::fs::read_to_string(path) {
             Ok(contents) => contents,
@@ -823,7 +1043,7 @@ fn frontmatter_edit(
         Err(message) => return fail(message),
     };
     let stamping = stamping(config);
-    dispatch(target, root, Some(&locks), |note, guard, seed| {
+    dispatch(target, root, Some(&locks), true, |note, guard, seed| {
         let guard = guard.expect("write dispatch locks the notebook");
         let seed = match seeding(&seed) {
             Ok(seed) => seed,
@@ -905,6 +1125,7 @@ fn daily_note(
     date: Option<String>,
     flag: Option<PathBuf>,
     locks: Option<&Path>,
+    seeded: bool,
     act: impl FnOnce(&Note, Option<&kladde::write::Guard>, Seed) -> ExitCode,
 ) -> ExitCode {
     let (config, root) = match layered_config(flag) {
@@ -931,7 +1152,7 @@ fn daily_note(
             let seed = daily_seed(
                 notebook,
                 config.daily_template.as_deref(),
-                locks.is_some(),
+                locks.is_some() && seeded,
                 day,
                 &note,
             );
@@ -943,10 +1164,11 @@ fn daily_note(
 
 /// The seed for a missing daily note: the configured template's
 /// contents, rendered for the note's date. `None` without a configured
-/// template, `None` for reads — only a write can need a seed, so read
-/// commands never touch the template file at all — and `None` when the
-/// note already exists, so the template is read only by the write that
-/// will use it. The existence probe runs under the write lock, like the
+/// template; `None` unless a creating write asks, since only such a
+/// write can need a seed, so reads and edits that never create leave
+/// the template file untouched; and `None` when the note already
+/// exists, so the template is read only by the write that will use it.
+/// The existence probe runs under the write lock, like the
 /// write it feeds. A template that cannot be resolved, read, or
 /// rendered becomes the error the write surfaces.
 fn daily_seed(
