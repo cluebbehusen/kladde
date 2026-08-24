@@ -131,9 +131,10 @@ enum Command {
     /// The bullet is matched by `--match`, a prefix of its first line
     /// past its marker, inside the scope `--under` and `--under-bullet`
     /// name the way an appended entry's place is. Exactly one bullet
-    /// must match, and a bullet holding anything beyond its first line,
-    /// child bullets or nested blocks, is refused rather than taken
-    /// with it. Nothing is created: a missing note has no bullet to
+    /// must match. The cut takes every line of the bullet's own
+    /// paragraph, so a bullet a formatter wrapped goes whole; a bullet
+    /// holding child bullets or nested blocks is refused rather than
+    /// taken with it. Nothing is created: a missing note has no bullet to
     /// match. With no target, the note is today's daily note. Writes
     /// take the notebook's lock and replace the note atomically.
     Remove {

@@ -404,16 +404,18 @@ fn appended(current: &str, entry: &str) -> String {
     new
 }
 
-/// `text` with the one bullet `query` names removed: its own line cut
+/// `text` with the one bullet `query` names removed: its own text cut
 /// out, never its thread. The bullet is matched inside the scope the
 /// placement names, by a prefix of its first line past its marker, the
 /// same contract an appended entry's target follows; the placement's
-/// indent is insertion's concern and is ignored here. A bullet holding
-/// content beyond its first line, or another addressable bullet on it,
-/// is refused rather than taken with it, and so is a bullet sharing
-/// its line with the parent that opened it; the line itself goes
-/// whole, whatever blocks its own text parses into, a spelled heading
-/// or a quoted remark alike. Cutting an ordered item renumbers the
+/// indent is insertion's concern and is ignored here. The cut takes
+/// every line of the bullet's own paragraph, so a bullet a formatter
+/// wrapped goes whole. A bullet holding any other block past its
+/// first line, or another addressable bullet, is refused rather than
+/// taken with it, and so is a bullet sharing its line with the parent
+/// that opened it; a single line goes whole, whatever blocks its own
+/// text parses into, a spelled heading or a quoted remark alike.
+/// Cutting an ordered item renumbers the
 /// items after it downward, the way deleting from a numbered list does
 /// everywhere; a cut that would raise a survivor's rendered number is
 /// refused instead.
@@ -457,11 +459,12 @@ pub fn removed(text: &str, query: &str, scope: &Placement) -> Result<String, Err
             query: query.to_owned(),
         });
     }
-    if line_end < bullet.span.end && !blank(&body[line_end..bullet.span.end]) {
+    let before = blocks(body);
+    let Some(end) = cut_end(body, bullet, start, line_end) else {
         return Err(Error::NestedContent {
             query: query.to_owned(),
         });
-    }
+    };
     // A marker-line child shares its line with its parent; cutting the
     // line would take a bullet the query never named.
     if content_start(body, &(start..line_end)) != content_start(body, &bullet.span) {
@@ -469,15 +472,105 @@ pub fn removed(text: &str, query: &str, scope: &Placement) -> Result<String, Err
             query: query.to_owned(),
         });
     }
-    // The cut takes exactly the named line, never a neighbor or a
-    // blank separator, and must leave the surroundings meaning what
+    // The cut takes exactly the bullet's own lines, never a neighbor or
+    // a blank separator, and must leave the surroundings meaning what
     // they meant; where it cannot, the removal is refused.
-    let before = blocks(body);
-    let candidate = excised(text, body_start + start..body_start + line_end);
-    if removal_kept(&candidate, &before, body, body_start, &(start..line_end)) {
+    let candidate = excised(text, body_start + start..body_start + end);
+    if removal_kept(&candidate, &before, body, body_start, &(start..end)) {
         return Ok(candidate);
     }
     Err(Error::RemovalReshapes)
+}
+
+/// Where the cut of a bullet ends: past its marker line when its
+/// content stops there, or past the line its content ends on when
+/// every later line continues the marker line's paragraph, the shape
+/// a formatter leaves a wrapped bullet in. That paragraph has to be
+/// the item's only block, begin on the marker line, and reach the
+/// item's last content byte: the parser consumes a link reference
+/// definition without an event, so source the paragraph does not
+/// cover is nested content even when no block says so, as is any
+/// other block past the marker line — a second paragraph, a fence, a
+/// quote. Nested content has no cut.
+fn cut_end(body: &str, bullet: &Bullet, start: usize, line_end: usize) -> Option<usize> {
+    let text_end = content_end(body, &bullet.span);
+    if text_end <= line_end {
+        return Some(line_end);
+    }
+    let paragraph = paragraph_extent(body, bullet)?;
+    // An escape's span skips its backslash, so the paragraph's start
+    // is checked by line; its end is checked to the byte.
+    if line_start(body, paragraph.start) != start || content_end(body, &paragraph) != text_end {
+        return None;
+    }
+    let last = line_start(body, text_end);
+    Some(last + line_len(&body[last..]))
+}
+
+/// The source extent of the one paragraph an item holds, from its
+/// first inline event to its last, or none when the item holds any
+/// other block or a second paragraph. A tight list's item wraps its
+/// paragraph in no block at all, so inline events count directly
+/// under the item as well as under a paragraph block.
+fn paragraph_extent(body: &str, bullet: &Bullet) -> Option<Range<usize>> {
+    let mut inside = false;
+    let mut paragraphs = 0;
+    let mut extent: Option<Range<usize>> = None;
+    for (event, span) in Parser::new(body).into_offset_iter() {
+        if !inside {
+            inside = matches!(event, Event::Start(Tag::Item)) && span == bullet.span;
+            continue;
+        }
+        match event {
+            Event::End(TagEnd::Item) => break,
+            Event::Start(Tag::Paragraph) => {
+                paragraphs += 1;
+                if paragraphs > 1 {
+                    return None;
+                }
+            }
+            Event::End(TagEnd::Paragraph) => {}
+            Event::Start(
+                Tag::Emphasis
+                | Tag::Strong
+                | Tag::Strikethrough
+                | Tag::Superscript
+                | Tag::Subscript
+                | Tag::Link { .. }
+                | Tag::Image { .. },
+            )
+            | Event::End(
+                TagEnd::Emphasis
+                | TagEnd::Strong
+                | TagEnd::Strikethrough
+                | TagEnd::Superscript
+                | TagEnd::Subscript
+                | TagEnd::Link
+                | TagEnd::Image,
+            )
+            | Event::Text(_)
+            | Event::Code(_)
+            | Event::InlineMath(_)
+            | Event::InlineHtml(_)
+            | Event::FootnoteReference(_)
+            | Event::SoftBreak
+            | Event::HardBreak
+            | Event::TaskListMarker(_) => {
+                extent = Some(match extent {
+                    None => span,
+                    Some(range) => range.start.min(span.start)..range.end.max(span.end),
+                });
+            }
+            Event::Start(_)
+            | Event::End(_)
+            | Event::Rule
+            | Event::Html(_)
+            | Event::DisplayMath(_) => {
+                return None;
+            }
+        }
+    }
+    extent
 }
 
 /// `text` with the one task `query` names checked or unchecked: the
@@ -2277,13 +2370,20 @@ mod tests {
         }
     }
 
+    /// Nested content is any block past the marker line other than
+    /// the continuation of its own paragraph: a child bullet, a second
+    /// paragraph, a fence with or without a blank before it, a quote,
+    /// a heading that interrupts the paragraph, or a rule.
     #[test]
     fn removed_refuses_nested_content() {
         let cases = [
             "- drop\n\t- child\n",
-            "- drop\n  more text\n",
+            "- drop\n\n  more text\n",
             "- drop\n\n  ```\n  code\n  ```\n",
+            "- drop\n  ```\n  code\n  ```\n",
             "- drop\n  > quoted\n",
+            "- drop\n  # spelled\n",
+            "- drop\n  ***\n",
         ];
         for text in cases {
             let error =
@@ -2294,6 +2394,97 @@ mod tests {
                 "for {text:?}"
             );
         }
+    }
+
+    /// A wrapped bullet, its paragraph continued on later lines the
+    /// way a formatter leaves it, goes whole: indented, tab-indented,
+    /// or lazily continued, in a tight list where the paragraph is
+    /// implicit and in a loose one where it is the item's only block,
+    /// nested in a thread, numbered, and at an unterminated end.
+    #[test]
+    fn removed_takes_a_wrapped_bullet() {
+        let cases = [
+            (
+                "- keep\n- drop wrapped\n  onto more\n  lines\n- also\n",
+                "drop",
+                &[][..],
+                "- keep\n- also\n",
+            ),
+            ("- drop\n\tmore\n- keep\n", "drop", &[][..], "- keep\n"),
+            ("- drop\nlazy\n- keep\n", "drop", &[][..], "- keep\n"),
+            (
+                "- a\n\n- drop wrapped\n  here\n\n- c\n",
+                "drop",
+                &[][..],
+                "- a\n\n\n- c\n",
+            ),
+            (
+                "- p\n\t- drop wrapped\n\t  here\n\t- keep\n",
+                "drop",
+                &["p"][..],
+                "- p\n\t- keep\n",
+            ),
+            (
+                "1. keep\n2. drop wrapped\n   here\n3. later\n",
+                "drop",
+                &[][..],
+                "1. keep\n3. later\n",
+            ),
+            ("- keep\n- drop\n  more", "drop", &[][..], "- keep\n"),
+            (
+                "- \\*drop\\* [wrapped](u) with `code`\n  and *more*\n- keep\n",
+                "\\*drop",
+                &[][..],
+                "- keep\n",
+            ),
+            (
+                "- keep\r\n- drop\r\n  more\r\n",
+                "drop",
+                &[][..],
+                "- keep\r\n",
+            ),
+        ];
+        for (text, query, bullets, expected) in cases {
+            let new = removed(text, query, &placed(&[], bullets)).expect("removal succeeds");
+            assert_eq!(new, expected, "for {text:?}");
+        }
+    }
+
+    /// A link reference definition leaves no event behind, so an item
+    /// holding one past its paragraph, before it, or as an ignored
+    /// duplicate is refused for the source its paragraph does not
+    /// cover; a definition that cannot interrupt the paragraph is
+    /// paragraph text, and goes with it.
+    #[test]
+    fn removed_refuses_a_hidden_definition() {
+        let cases = [
+            (
+                "- a\n\n- drop\n\n  [ref]: /url\n\n- keep [link][ref]\n",
+                "drop",
+            ),
+            ("- [ref]: /url\n  drop\n- keep [ref]\n", "[ref]"),
+            ("- [ref]:\n  /url\n  drop\n- keep [ref]\n", "[ref]"),
+            (
+                "[ref]: /a\n\n- x\n\n- drop\n\n  [ref]: /dup\n\n- keep [ref]\n",
+                "drop",
+            ),
+        ];
+        for (text, query) in cases {
+            let error =
+                removed(text, query, &placed(&[], &[])).expect_err("hidden definition refuses");
+            assert_eq!(
+                error.to_string(),
+                format!("the bullet matching \"{query}\" holds nested content"),
+                "for {text:?}"
+            );
+        }
+        let new = removed(
+            "- drop\n  [ref]: /url\n- keep [ref]\n",
+            "drop",
+            &placed(&[], &[]),
+        )
+        .expect("paragraph text goes with its bullet");
+        assert_eq!(new, "- keep [ref]\n");
     }
 
     /// The cut takes exactly the named line: blank lines around it,
