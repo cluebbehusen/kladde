@@ -6459,10 +6459,28 @@ fn remove_reports_unmatched_and_invalid_targets() {
             "the bullet matching \"drop\" holds nested content",
         ),
         (
-            "- drop\n  more text\n",
+            "- drop\n\n  a second paragraph\n",
             "drop",
             &[][..],
             "the bullet matching \"drop\" holds nested content",
+        ),
+        (
+            "- drop\n  ***\n",
+            "drop",
+            &[][..],
+            "the bullet matching \"drop\" holds nested content",
+        ),
+        (
+            "- a\n\n- drop\n\n  [ref]: /url\n\n- keep [link][ref]\n",
+            "drop",
+            &[][..],
+            "the bullet matching \"drop\" holds nested content",
+        ),
+        (
+            "- [ref]: /url\n  drop\n- keep [ref]\n",
+            "[ref]",
+            &[][..],
+            "the bullet matching \"[ref]\" holds nested content",
         ),
         (
             "- - child\n- keep\n",
@@ -6513,6 +6531,26 @@ fn remove_reports_unmatched_and_invalid_targets() {
             .stderr(contains(fragment));
         assert_eq!(x_contents(&nb), contents, "for {matched:?} {args:?}");
     }
+}
+
+/// A bullet `prettier` wrapped with `proseWrap: always` is still one
+/// paragraph, and goes whole.
+#[test]
+fn remove_takes_a_wrapped_bullet() {
+    let nb = temp();
+    let state = temp();
+    let xdg = temp();
+    let contents = "## Stream\n\n- Kept\n- Dug into a *long* bullet that `prettier`\n  wrapped onto a [second](https://prettier.io) line\n- Also kept\n";
+    remove_from(
+        &nb,
+        &state,
+        &xdg,
+        contents,
+        "Dug into",
+        &["--under", "Stream"],
+    )
+    .success();
+    assert_eq!(x_contents(&nb), "## Stream\n\n- Kept\n- Also kept\n");
 }
 
 /// The cut takes exactly the named line: every blank the note held
